@@ -33,6 +33,7 @@ def make_flow() -> Flow:
         CREDENTIALS_FILE,
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
+        autogenerate_code_verifier=False,
     )
 
 def get_auth_url(state: str) -> str:
