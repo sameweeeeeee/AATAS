@@ -1,0 +1,18 @@
+# secrets
+.env
+credentials.json
+
+# python cache
+__pycache__/
+*.pyc
+
+# logs
+logs/
+*.log
+
+# mac
+.DS_Store
+
+# virtual env (if you ever use one)
+venv/
+.env/

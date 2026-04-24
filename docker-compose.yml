@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    command: python api/server.py
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./credentials.json:/app/credentials.json:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GOOGLE_CREDENTIALS_FILE=credentials.json
+      - OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI}
+      - DB_PATH=data/aatas.db
+      - PORT=8000
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: python bot/aatas_bot.py
+    depends_on:
+      - api
+    volumes:
+      - ./data:/app/data
+      - ./credentials.json:/app/credentials.json:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GOOGLE_CREDENTIALS_FILE=credentials.json
+      - DB_PATH=data/aatas.db
+    restart: unless-stopped
