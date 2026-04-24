@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 from api.brain import AATASBrain
-from api.gmail_auth import get_auth_url
+from api.gmail_auth import get_auth_url, get_gmail_service
 from api.gmail_ops import (
     archive_email, apply_label, apply_rules, fetch_emails,
     mark_read, send_reply, trash_email,
@@ -168,7 +168,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "I'm AATAS — your self-trained AI Gmail manager.\n"
             "Just talk to me naturally — I understand what you need.\n\n"
             "Try: _\"show my inbox\"_ or _\"archive anything about promotions\"_\n\n"
-            "🎓 Want to train me? Type `/train 24426`",
+            "🎓 Want to train me? Type `/train [SECRET CODE]`",
             parse_mode="Markdown",
         )
     elif _has_accepted_tos(db, user):
@@ -257,7 +257,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/stats — Show AI model stats\n"
         "/help — This message\n\n"
         "🎓 *Train me to understand your style:*\n"
-        "Type `/train 24426` to enter teacher mode!\n"
+        "Type `/train [secret code]` to enter teacher mode!\n"
         "The more you teach me, the smarter I get.",
         parse_mode="Markdown",
     )
@@ -441,7 +441,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state   = _trainer.get(tg_id, {})
 
     if not state.get("active"):
-        await update.message.reply_text("You're not in trainer mode. Use `/train 24426` to start.")
+        await update.message.reply_text("You're not in trainer mode. Use `/train [secret code]` to start.")
         return
 
     added = state.get("added", 0)
@@ -474,7 +474,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Retraining complete!*\n\n"
             f"📊 {intent_line}\n"
             f"📊 {priority_line}\n\n"
-            "AATAS is now smarter. You can keep training any time with `/train 24426`! 🎓",
+            "AATAS is now smarter. You can keep training any time with `/train [secret code]`! 🎓",
             parse_mode="Markdown",
         )
     except Exception as ex:
@@ -498,7 +498,7 @@ async def cmd_priority_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if not _trainer.get(tg_id, {}).get("active"):
         await update.message.reply_text(
-            "You need to be in trainer mode first. Use `/train 24426`."
+            "You need to be in trainer mode first. Use `/train [secret code]`."
         )
         return
 
