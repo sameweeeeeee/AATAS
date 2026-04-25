@@ -148,9 +148,9 @@ def _intent_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⏭ Skip this one", callback_data="train_intent:skip")])
     return InlineKeyboardMarkup(rows)
 
-def _priority_keyboard() -> InlineKeyboardMarkup:
+def _priority_keyboard(email_idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(label, callback_data=f"train_priority:{cb}")
+        InlineKeyboardButton(label, callback_data=f"train_priority:{cb}:{email_idx}")
         for label, cb in _PRIORITY_LABELS
     ]])
 
@@ -655,10 +655,8 @@ async def cmd_priority_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"👤 {_esc(e['sender'][:40])}\n\n"
                 "_How urgent is this email?_",
                 parse_mode="Markdown",
-                reply_markup=_priority_keyboard(),
+                reply_markup=_priority_keyboard(e['idx']),
             )
-            # store email in state for the callback to pick up
-            _trainer[tg_id]["pending_email"] = e
 
     except Exception as ex:
         await msg.edit_text(f"❌ {ex}")
@@ -1120,14 +1118,17 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # ── Trainer priority labelling ────────────────────────
         if data.startswith("train_priority:"):
-            priority = data.split(":", 1)[1]
-            state    = _trainer.get(tg_id, {})
-            email    = state.get("pending_email")
+            _, priority, idx = data.split(":")
+            state = _trainer.get(tg_id, {})
+            email = _cached(tg_id, int(idx))
+
+            if not state.get("active"):
+                await q.edit_message_text("❌ You're no longer in trainer mode.")
+                return
 
             if email:
                 brain.learn_priority(email["subject"], email["body"], priority)
                 state["added"] += 1
-                state["pending_email"] = None
                 await q.edit_message_text(
                     f"✅ Rated *{_esc(email['subject'][:40])}* as `{_esc(priority)}`\n"
                     f"Total ratings this session: *{state['added']}*",
