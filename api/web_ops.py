@@ -5,7 +5,24 @@ from ddgs import DDGS
 log = logging.getLogger(__name__)
 
 
-def search_web(query: str, max_results: int = 5) -> list[dict]:
+def search_web(
+    query: str,
+    max_results: int = 5,
+    db=None,          # optional SQLAlchemy Session — enables cache when provided
+) -> list[dict]:
+    """
+    Search the web via DuckDuckGo and return a list of result dicts.
+
+    When a SQLAlchemy *db* Session is supplied the function:
+      1. Checks the persistent SearchCache for a fresh result.
+      2. Returns cached results immediately on a hit (no network call).
+      3. On a miss, performs the live DDG search and stores the result
+         in the cache with an appropriate TTL (short for time-sensitive
+         queries like weather/prices, longer for general queries).
+
+    The cache is implemented in db/database.py — see SearchCache model and
+    get_cached_search / set_cached_search helpers for TTL configuration.
+    """
     # Beef up vague single-word queries that DDG struggles with
     generic_map = {
         "news":          "latest world news today",
@@ -16,24 +33,47 @@ def search_web(query: str, max_results: int = 5) -> list[dict]:
         "weather":       "weather today",
     }
     query = generic_map.get(query.lower().strip(), query)
-    
+
+    # ── Cache look-up ─────────────────────────────
+    if db is not None:
+        try:
+            from db.database import get_cached_search, set_cached_search
+            cached = get_cached_search(db, query)
+            if cached is not None:
+                log.info(f"Cache HIT for '{query}' ({len(cached)} results served without network call)")
+                return cached
+            log.info(f"Cache MISS for '{query}' — performing live search")
+        except Exception as exc:
+            log.warning(f"Cache look-up failed (continuing with live search): {exc}")
+
+    # ── Live DDG search ───────────────────────────
+    results: list[dict] = []
     try:
         with DDGS() as ddgs:
             raw = list(ddgs.text(query, max_results=max_results))
             log.info(f"DDG search for '{query}' returned {len(raw)} results")
             if not raw:
                 log.warning(f"DDG returned empty results for query: '{query}'")
-            results = []
             for r in raw:
                 results.append({
                     "title":   r.get("title", ""),
                     "link":    r.get("href", ""),
                     "snippet": r.get("body", ""),
                 })
-            return results
     except Exception as e:
         log.error(f"Web search failed for '{query}': {type(e).__name__}: {e}")
         return []
+
+    # ── Store in cache ────────────────────────────
+    if db is not None and results:
+        try:
+            from db.database import set_cached_search
+            set_cached_search(db, query, results)
+            log.info(f"Cached {len(results)} results for '{query}'")
+        except Exception as exc:
+            log.warning(f"Failed to write search cache (non-fatal): {exc}")
+
+    return results
 
 
 def scrape_page(url: str) -> str:

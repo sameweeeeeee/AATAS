@@ -41,6 +41,7 @@ from api.web_ops import search_web, scrape_page
 from db.database import (
     ActionLog, AutomationRule, SessionLocal,
     add_rule, get_or_create_user, get_rules, log_action, upsert_memory, get_memories,
+    purge_expired_cache, get_cache_stats,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -90,6 +91,10 @@ _trainer: dict[int, dict] = {}
 
 # Compose drafts per user
 _drafts: dict[int, dict] = {}
+
+# Last intent per user for /wrong correction command
+# {telegram_id: {"action": str, "original_text": str}}
+_last_intent: dict[int, dict] = {}
 
 PRIORITY_ICON = {"urgent": "🔴", "important": "🟡", "normal": "🟢", "low": "⚪"}
 
@@ -151,6 +156,18 @@ def _intent_keyboard() -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("⏭ Skip this one", callback_data="train_intent:skip")])
+    return InlineKeyboardMarkup(rows)
+
+def _correction_keyboard(wrong_intent: str, original_text: str) -> InlineKeyboardMarkup:
+    rows = []
+    row  = []
+    for label, cb in _INTENT_LABELS:
+        row.append(InlineKeyboardButton(label, callback_data=f"correct_pick:{wrong_intent}:{cb}:{original_text[:40]}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⏭ Never mind", callback_data="correct_pick:skip:skip:skip")])
     return InlineKeyboardMarkup(rows)
 
 def _priority_keyboard(email_idx: int) -> InlineKeyboardMarkup:
@@ -663,6 +680,25 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You're not in trainer mode.")
 
 
+# ── /wrong — correct the last intent ─────────────────────────
+
+async def cmd_wrong(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    last  = _last_intent.get(tg_id)
+    if not last:
+        await update.message.reply_text(
+            "No recent action to correct. Send a command first, then use /wrong if I misunderstood."
+        )
+        return
+    wrong_intent  = last["action"]
+    original_text = last["original_text"]
+    await update.message.reply_text(
+        f"What should I have done with:\n`{original_text[:80]}`\n\nPick the correct intent:",
+        parse_mode="Markdown",
+        reply_markup=_correction_keyboard(wrong_intent, original_text),
+    )
+
+
 # ── /priority — switch to priority training ───────────────────
 
 async def cmd_priority_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -823,8 +859,11 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     tg_id  = user.telegram_id
 
     if ai_reply:
+        _no_correct = {"archive", "trash", "label", "reply", "compose"}
+        if action not in _no_correct:
+            _last_intent[tg_id] = {"action": action, "original_text": original_text}
         await update.message.reply_text(ai_reply, parse_mode="Markdown")
-
+            
     if action == "fetch_inbox":
         brain.record_passive_example(original_text, action)
         if svc:
@@ -907,13 +946,28 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
             await update.message.reply_text("What would you like me to search for?")
             return
 
-        msg = await update.message.reply_text(f"🌐 Searching for '{query}'...")
-        results = search_web(query, max_results=5)
+        # Check if this query is already cached BEFORE calling search_web
+        # so we can show the right status message to the user
+        _is_cache_hit = False
+        if db is not None:
+            try:
+                from db.database import get_cached_search as _gcs
+                _is_cache_hit = _gcs(db, query) is not None
+            except Exception:
+                pass
+
+        if _is_cache_hit:
+            msg = await update.message.reply_text(f"⚡ Retrieving cached results for '{query}'...")
+        else:
+            msg = await update.message.reply_text(f"🌐 Searching for '{query}'...")
+
+        results = search_web(query, max_results=5, db=db)
         
         if not results:
             await msg.edit_text(f"⚠️ No results found for *'{query}'*. Try rephrasing your search.", parse_mode="Markdown")
         else:
-            lines = [f"🌐 *Web Search Results for '{query}':*\n"]
+            source_tag = "_(from cache — instant result)_" if _is_cache_hit else "_(live search)_"
+            lines = [f"🌐 *Web Search Results for '{query}':*  {source_tag}\n"]
             cache_data = []
             for i, r in enumerate(results, 1):
                 lines.append(f"`{i}.` *{r['title']}*\n   _{r['snippet'][:150]}..._")
@@ -1176,6 +1230,35 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await _typing(update)
+        # ── Correction flow ───────────────────────────────────
+        if data.startswith("correct:"):
+            parts         = data.split(":", 2)
+            wrong_intent  = parts[1]
+            original_text = parts[2]
+            await q.edit_message_reply_markup(reply_markup=None)
+            await q.message.reply_text(
+                f"What should I have done with:\n`{original_text[:80]}`\n\nPick the correct intent:",
+                parse_mode="Markdown",
+                reply_markup=_correction_keyboard(wrong_intent, original_text),
+            )
+            return
+
+        elif data.startswith("correct_pick:"):
+            parts          = data.split(":", 3)
+            wrong_intent   = parts[1]
+            correct_intent = parts[2]
+            original_text  = parts[3]
+            if correct_intent == "skip":
+                await q.edit_message_reply_markup(reply_markup=None)
+                return
+            brain.record_correction(original_text, wrong_intent, correct_intent)
+            await q.edit_message_text(
+                f"✅ Learned that:\n`{original_text[:60]}`\n"
+                f"means `{correct_intent}` not `{wrong_intent}`.\n\nModel updated! 🧠",
+                parse_mode="Markdown",
+            )
+            return
+
         # ── Trainer intent labelling ──────────────────────────
         if data.startswith("train_intent:"):
             intent_label = data.split(":", 1)[1]
@@ -1295,6 +1378,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("train",    cmd_train))
     app.add_handler(CommandHandler("done",     cmd_done))
     app.add_handler(CommandHandler("skip",     cmd_skip))
+    app.add_handler(CommandHandler("wrong",    cmd_wrong))
     app.add_handler(CommandHandler("priority", cmd_priority_train))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_cb))
@@ -1322,6 +1406,7 @@ async def _set_commands(app: Application):
         BotCommand("train",    "Enter trainer mode (secret code required)"),
         BotCommand("help",     "Help"),
         BotCommand("revert",   "Exit Jarvis mode, return to normal style"),
+        BotCommand("wrong",    "Correct my last misunderstood action"),
     ])
 
 
@@ -1331,6 +1416,16 @@ if __name__ == "__main__":
 
     async def post_init(app):
         await _set_commands(app)
+        # Clean up any stale search cache rows from previous runs
+        _startup_db = _db()
+        try:
+            deleted = purge_expired_cache(_startup_db)
+            if deleted:
+                log.info(f"Startup: purged {deleted} expired search cache entries")
+        except Exception as exc:
+            log.warning(f"Startup cache purge failed (non-fatal): {exc}")
+        finally:
+            _startup_db.close()
 
     application.post_init = post_init
     application.run_polling(drop_pending_updates=True)

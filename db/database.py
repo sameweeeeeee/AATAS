@@ -9,7 +9,7 @@ SQLite via SQLAlchemy for:
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -128,6 +128,43 @@ class ActionLog(Base):
     user        = relationship("User", back_populates="history")
 
 
+class SearchCache(Base):
+    """
+    Persistent cache for web search results.
+
+    Each row stores a normalised query string → JSON-serialised result list,
+    plus an *expires_at* timestamp so stale entries are never served.
+
+    TTL strategy (configurable via SEARCH_CACHE_TTL_SECONDS env var):
+      - Weather / price queries  → short TTL (default 10 min)
+      - General queries          → longer TTL (default 1 hour)
+    """
+    __tablename__ = "search_cache"
+
+    id          = Column(Integer, primary_key=True)
+    query_key   = Column(String(512), unique=True, nullable=False, index=True)
+    results_json = Column(Text, nullable=False)   # JSON list of {title, link, snippet}
+    hit_count   = Column(Integer, default=0)      # how many times this cache entry was reused
+    cached_at   = Column(DateTime, default=datetime.utcnow)
+    expires_at  = Column(DateTime, nullable=False, index=True)
+
+
+class KnowledgeEntry(Base):
+    """
+    Math and science knowledge base entries.
+    Each entry has a topic, a question/trigger phrase, and a full explanation.
+    Searched via keyword matching when math_query or science_query intent fires.
+    """
+    __tablename__ = "knowledge"
+
+    id          = Column(Integer, primary_key=True)
+    domain      = Column(String(32), index=True)   # "math" | "science"
+    topic       = Column(String(128), index=True)  # e.g. "quadratic equation"
+    keywords    = Column(Text)                     # space-separated trigger words
+    explanation = Column(Text, nullable=False)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+
 # ── Create tables ─────────────────────────────────
 Base.metadata.create_all(engine)
 
@@ -203,3 +240,146 @@ def upsert_memory(db: Session, user_id: int, key: str, value: str):
 def get_memories(db: Session, user_id: int) -> dict[str, str]:
     mems = db.query(Memory).filter_by(user_id=user_id).all()
     return {m.key: m.value for m in mems}
+
+def search_knowledge(db: Session, query: str, domain: str | None = None, top_k: int = 3) -> list["KnowledgeEntry"]:
+    """
+    TF-IDF-style keyword search over the knowledge base.
+    Scores each entry by how many query words appear in its topic + keywords + explanation.
+    Returns the top_k most relevant entries, optionally filtered by domain.
+    """
+    q_words = set(query.lower().split())
+    entries = db.query(KnowledgeEntry)
+    if domain:
+        entries = entries.filter_by(domain=domain)
+    entries = entries.all()
+
+    scored = []
+    for e in entries:
+        haystack = f"{e.topic} {e.keywords} {e.explanation}".lower()
+        score = sum(1 for w in q_words if w in haystack)
+        if score > 0:
+            scored.append((score, e))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [e for _, e in scored[:top_k]]
+
+def add_knowledge(db: Session, domain: str, topic: str, keywords: str, explanation: str) -> "KnowledgeEntry":
+    entry = KnowledgeEntry(domain=domain, topic=topic, keywords=keywords, explanation=explanation)
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+# ── Search Cache ──────────────────────────────────
+
+# Default TTLs (override via env vars)
+_DEFAULT_TTL_SHORT   = int(os.environ.get("SEARCH_CACHE_TTL_SHORT_SECONDS",   600))   # 10 min — weather, prices
+_DEFAULT_TTL_GENERAL = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS",         3600))  # 1 hour — general queries
+
+# Keywords that indicate time-sensitive queries deserving a shorter TTL
+_SHORT_TTL_KEYWORDS = {
+    "weather", "temperature", "rain", "forecast", "humidity", "wind",
+    "price", "stock", "crypto", "bitcoin", "ethereum", "rate", "exchange",
+    "news", "breaking", "today", "tonight", "now", "live", "score", "result",
+}
+
+
+def _normalise_query(query: str) -> str:
+    """Lowercase + collapse whitespace so minor phrasing differences share a cache entry."""
+    return " ".join(query.lower().split())
+
+
+def _ttl_for_query(query: str) -> int:
+    """Return a TTL (seconds) appropriate for the query's volatility."""
+    words = set(query.lower().split())
+    if words & _SHORT_TTL_KEYWORDS:
+        return _DEFAULT_TTL_SHORT
+    return _DEFAULT_TTL_GENERAL
+
+
+def get_cached_search(db: Session, query: str) -> list[dict] | None:
+    """
+    Return cached results for *query* if a fresh entry exists, else None.
+    Increments the hit_count so you can see how effective caching is.
+    """
+    key = _normalise_query(query)
+    entry = db.query(SearchCache).filter_by(query_key=key).first()
+    if entry is None:
+        return None
+    if entry.expires_at < datetime.utcnow():
+        # Stale — delete and signal a miss so the caller re-fetches
+        db.delete(entry)
+        db.commit()
+        return None
+    # Cache hit — bump the counter and return results
+    entry.hit_count += 1
+    db.commit()
+    return json.loads(entry.results_json)
+
+
+def set_cached_search(db: Session, query: str, results: list[dict]) -> None:
+    """
+    Persist *results* for *query*.  Upserts so repeated searches overwrite
+    the old entry rather than creating duplicates.
+    """
+    if not results:
+        return  # Don't cache empty result sets
+
+    key      = _normalise_query(query)
+    ttl      = _ttl_for_query(query)
+    expires  = datetime.utcnow() + timedelta(seconds=ttl)
+    payload  = json.dumps(results, ensure_ascii=False)
+
+    entry = db.query(SearchCache).filter_by(query_key=key).first()
+    if entry:
+        entry.results_json = payload
+        entry.cached_at    = datetime.utcnow()
+        entry.expires_at   = expires
+        # Reset hit count on refresh so stats reflect the new cache window
+        entry.hit_count    = 0
+    else:
+        db.add(SearchCache(
+            query_key=key,
+            results_json=payload,
+            expires_at=expires,
+        ))
+    db.commit()
+
+
+def purge_expired_cache(db: Session) -> int:
+    """
+    Delete all expired cache rows.  Call this periodically (e.g. on bot start
+    or in a background task) to keep the DB tidy.
+    Returns the number of rows deleted.
+    """
+    deleted = (
+        db.query(SearchCache)
+        .filter(SearchCache.expires_at < datetime.utcnow())
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return deleted
+
+
+def get_cache_stats(db: Session) -> dict:
+    """Return a quick summary of the cache table (useful for /admin or debugging)."""
+    total   = db.query(SearchCache).count()
+    live    = db.query(SearchCache).filter(SearchCache.expires_at >= datetime.utcnow()).count()
+    expired = total - live
+    top_hits = (
+        db.query(SearchCache)
+        .filter(SearchCache.expires_at >= datetime.utcnow())
+        .order_by(SearchCache.hit_count.desc())
+        .limit(5)
+        .all()
+    )
+    return {
+        "total_entries":   total,
+        "live_entries":    live,
+        "expired_entries": expired,
+        "top_queries": [
+            {"query": e.query_key, "hits": e.hit_count}
+            for e in top_hits
+        ],
+    }

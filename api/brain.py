@@ -12,15 +12,19 @@ Intelligence features:
 
 import re
 import random
+import logging
 from api.memory_guesser import MemoryGuesser
 import math
 from collections import Counter
 from typing import Optional
 
+log = logging.getLogger(__name__)
+
 from db.database import (
     Session, User,
     get_conv_history, save_conv_turn,
     get_memories, upsert_memory,
+    search_knowledge,
 )
 from files.ml.trainer import get_intent_model, get_priority_model
 from files.ml.rule_parser import parse_rule
@@ -723,6 +727,42 @@ _RESPONSES: dict[str, dict[str, list[str]]] = {
         ],
     },
 
+    "math_query": {
+        "casual": [
+            "On it! Let me crunch that for you. 🔢",
+            "Great question — here's what I know about that! 📐",
+            "Let's work through this together. 🧮",
+        ],
+        "formal": [
+            "Retrieving the relevant mathematical explanation.",
+            "Here is the pertinent mathematical information.",
+        ],
+        "terse": ["Calculating... 🔢", "Math answer:", "Here:"],
+        "jarvis": [
+            "Running the mathematical analysis now, Sir.",
+            "Accessing the knowledge matrix for that formula, Sir.",
+            "Retrieving the requested mathematical data, Sir.",
+        ],
+    },
+
+    "science_query": {
+        "casual": [
+            "Great science question! Here's what I've got. 🔬",
+            "Let me pull that up from my science knowledge. ⚗️",
+            "Science time! Here's what I know. 🧪",
+        ],
+        "formal": [
+            "Retrieving the relevant scientific explanation.",
+            "Here is the pertinent scientific information.",
+        ],
+        "terse": ["Science answer:", "Here:", "Got it:"],
+        "jarvis": [
+            "Accessing the scientific database, Sir.",
+            "Running the scientific analysis, Sir.",
+            "Retrieving the requested scientific data, Sir.",
+        ],
+    },
+
     "chat_goodbye": {
         "casual": [
             "Goodbye! Have a wonderful day. 👋",
@@ -750,6 +790,45 @@ _RESPONSES: dict[str, dict[str, list[str]]] = {
         "jarvis": [
             "As you wish, Sir. Reverting to standard operating mode.",
             "Jarvis Protocol suspended, Sir. Defaulting to casual mode.",
+        ],
+    },
+    "code_generate": {
+        "casual": [
+            "Sure! Let me write that for you. 💻",
+            "On it! Here's the code:",
+            "Here you go! 🧑‍💻",
+        ],
+        "terse": ["Here:", "Code below:", "💻"],
+        "formal": ["Certainly. Here is the requested code:", "As requested:"],
+        "jarvis": [
+            "Compiling your request now, Sir.",
+            "Writing the code as instructed, Sir.",
+        ],
+    },
+    "code_explain": {
+        "casual": [
+            "Let me break that down for you! 🔍",
+            "Sure, here's what that code does:",
+            "Happy to explain! 👇",
+        ],
+        "terse": ["Here's the breakdown:", "Explanation:"],
+        "formal": ["I will now explain the provided code:", "Here is the explanation:"],
+        "jarvis": [
+            "Analysing the code now, Sir.",
+            "Allow me to break this down for you, Sir.",
+        ],
+    },
+    "code_debug": {
+        "casual": [
+            "Let me take a look at what's wrong! 🐛",
+            "I'll find the bug for you!",
+            "On it — let me debug this. 🔧",
+        ],
+        "terse": ["Debugging:", "Found it:"],
+        "formal": ["I will now analyse the code for errors:", "Reviewing for bugs:"],
+        "jarvis": [
+            "Running diagnostics on your code, Sir.",
+            "Scanning for errors now, Sir.",
         ],
     },
 }
@@ -922,6 +1001,31 @@ class AATASBrain:
             if s_text.lower().strip().rstrip("!.~ ") in ack_words:
                 predictions.append(("chat_thanks", 0.85))
 
+            # Code generation intent
+            code_generate_keywords = [
+                "write me", "write a", "create a", "make a", "generate",
+                "code for", "script for", "function for", "function that",
+                "program that", "class that", "how do i code", "how to code",
+                "give me code", "can you code",
+            ]
+            code_explain_keywords = [
+                "explain this code", "what does this code do", "explain this",
+                "what does this do", "walk me through", "what is this code",
+                "break this down", "what does this mean",
+            ]
+            code_debug_keywords = [
+                "debug", "fix this", "fix my code", "whats wrong", "what's wrong",
+                "find the bug", "error in", "not working", "broken code",
+                "why is this failing", "why doesn't this work", "why isnt this working",
+            ]
+
+            if any(k in s_text.lower() for k in code_generate_keywords):
+                predictions.append(("code_generate", 0.85))
+            elif any(k in s_text.lower() for k in code_explain_keywords):
+                predictions.append(("code_explain", 0.85))
+            elif any(k in s_text.lower() for k in code_debug_keywords):
+                predictions.append(("code_debug", 0.85))
+
             # Heuristic for 'web_search' intent
             if not any(p[0] == "web_search" for p in predictions):
                 # Only add web_search if we don't already have a strong chat intent
@@ -948,6 +1052,50 @@ class AATASBrain:
                 research_keywords = ["research", "summarize that page", "what's on this site", "analyze this url"]
                 if any(k in s_text.lower() for k in research_keywords):
                     predictions.append(("research", 0.7))
+
+            # Heuristic for 'math_query' intent
+            if not any(p[0] == "math_query" for p in predictions):
+                import re as _re
+                _arith_words = [
+                    "plus", "minus", "times", "divided by", "multiplied by",
+                    "squared", "cubed", "square root", "percent", "remainder",
+                    "added to", "subtracted from", "modulo",
+                ]
+                _math_topic_words = [
+                    "solve", "calculate", "equation", "formula", "derivative",
+                    "integral", "quadratic", "pythagoras", "factor", "simplify",
+                    "algebra", "calculus", "trigonometry", "sin", "cos", "tan",
+                    "logarithm", "exponent", "matrix", "vector", "probability",
+                    "statistics", "mean", "median", "variance", "polynomial",
+                    "how do i solve", "what is the formula", "how to calculate",
+                    "what does dx mean", "what is pi",
+                ]
+                _s_lower = s_text.lower()
+                _has_operator_expr = bool(_re.search(r'\d+\s*[\+\-\*\/\^x]\s*\d+', _s_lower))
+                _has_arith_word    = any(k in _s_lower for k in _arith_words)
+                _has_topic_word    = any(k in _s_lower for k in _math_topic_words)
+                _has_number        = bool(_re.search(r'\d', _s_lower))
+                if _has_operator_expr or _has_topic_word or (_has_arith_word and _has_number):
+                    predictions.append(("math_query", 0.75))
+
+            # Heuristic for 'science_query' intent
+            if not any(p[0] == "science_query" for p in predictions):
+                science_keywords = [
+                    "atom", "molecule", "electron", "proton", "neutron", "nucleus",
+                    "photosynthesis", "mitosis", "dna", "rna", "protein", "enzyme",
+                    "newton", "gravity", "force", "mass", "acceleration", "velocity",
+                    "energy", "kinetic", "potential", "thermodynamics", "entropy",
+                    "chemical", "reaction", "element", "periodic table", "bond",
+                    "cell", "organism", "evolution", "species", "ecosystem",
+                    "electromagnetic", "wavelength", "frequency", "ohm", "voltage",
+                    "how does", "what is", "explain", "what causes", "why does",
+                ]
+                # Only trigger science if the query looks knowledge-seeking
+                knowledge_triggers = ["how does", "what is", "explain", "what causes", "why does", "describe"]
+                is_knowledge_q = any(k in s_text.lower() for k in knowledge_triggers)
+                has_sci_term   = any(k in s_text.lower() for k in science_keywords[:-5])
+                if is_knowledge_q and has_sci_term:
+                    predictions.append(("science_query", 0.75))
 
             # ── Process predictions for this sentence ───────────────────────
             
@@ -1038,6 +1186,62 @@ class AATASBrain:
                         reply += "\n" + "\n".join(fact_replies)
                     else:
                         reply = "I'm sorry, I don't have any specific records of that in my memory yet. 🧠"
+
+                elif intent in ("math_query", "science_query"):
+                    # ── Step 1: try to evaluate arithmetic directly ───────
+                    import re as _re
+                    _calc_result = None
+                    if intent == "math_query":
+                        _expr = s_text.lower().strip()
+                        # Normalise word operators
+                        _expr = _re.sub(r'\bplus\b',           '+',  _expr)
+                        _expr = _re.sub(r'\bminus\b',          '-',  _expr)
+                        _expr = _re.sub(r'\btimes\b',          '*',  _expr)
+                        _expr = _re.sub(r'\bmultiplied by\b',  '*',  _expr)
+                        _expr = _re.sub(r'\bdivided by\b',     '/',  _expr)
+                        _expr = _re.sub(r'\bsquared\b',        '**2',_expr)
+                        _expr = _re.sub(r'\bcubed\b',          '**3',_expr)
+                        _expr = _re.sub(r'\bto the power of\b','**', _expr)
+                        _expr = _re.sub(r'\bsquare root of\b', 'sqrt', _expr)
+                        _expr = _re.sub(r'\bmod\b|\bmodulo\b', '%',  _expr)
+                        # Strip everything except digits and operators
+                        _clean = _re.sub(r'[^\d\.\+\-\*\/\(\)\%\^\s]', '', _expr).strip()
+                        _clean = _clean.replace('^', '**')
+                        if _clean and _re.search(r'\d', _clean):
+                            try:
+                                _calc_result = eval(  # noqa: S307
+                                    _clean,
+                                    {"__builtins__": {}},
+                                    {"sqrt": lambda x: x ** 0.5},
+                                )
+                            except Exception:
+                                _calc_result = None
+
+                    if _calc_result is not None:
+                        # Format nicely — drop .0 for whole numbers
+                        _fmt = int(_calc_result) if isinstance(_calc_result, float) and _calc_result == int(_calc_result) else _calc_result
+                        reply = f"That's *{_fmt}*. 🔢"
+                    else:
+                        # ── Step 2: search the knowledge base ────────────
+                        domain = "math" if intent == "math_query" else "science"
+                        hits   = search_knowledge(db, s_text, domain=domain, top_k=2)
+                        if hits:
+                            parts = []
+                            for h in hits:
+                                parts.append(f"*{_esc(h.topic)}*\n{_esc(h.explanation)}")
+                            reply += "\n\n" + "\n\n─────\n\n".join(parts)
+                        else:
+                            # Fallback: try searching without domain filter
+                            hits = search_knowledge(db, s_text, domain=None, top_k=1)
+                            if hits:
+                                h = hits[0]
+                                reply += f"\n\n*{_esc(h.topic)}*\n{_esc(h.explanation)}"
+                            else:
+                                reply = (
+                                    "I don't have that in my knowledge base yet. 📚\n"
+                                    "Try rephrasing, or use `/wrong` if I misunderstood your question.\n"
+                                    "You can also ask me to search the web for it!"
+                                )
 
                 reply_texts.append(reply)
                 intent_dicts.append(intent_dict)
@@ -1247,6 +1451,15 @@ class AATASBrain:
                 self.intent_model.retrain()
             except Exception:
                 pass
+
+    def record_correction(self, text: str, wrong_intent: str, correct_intent: str):
+        for _ in range(5):
+            self.intent_model.add_example(text, correct_intent)
+        log.info(f"Correction: '{text}' was '{wrong_intent}' → now '{correct_intent}'")
+        try:
+            self.intent_model.retrain()
+        except Exception as e:
+            log.error(f"Retrain after correction failed: {e}")
 
     def record_passive_priority_example(self, subject: str, body: str, action: str):
         """Learn priority passively from user actions (archive, trash, reply)."""
