@@ -788,7 +788,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx_hint = ""
         if cached:
             ctx_hint = "Cached emails:\n" + "\n".join(
-                f"{e['idx']}. {e['subject']} | {e['sender']}" for e in cached[:10]
+                f"{e['idx']}. {e.get('subject', e.get('title', ''))} | {e.get('sender', '')}" for e in cached[:10]
             )
 
         reply_texts, intent_dicts = brain.chat(
@@ -867,7 +867,10 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
                 _cache[tg_id] = emails
                 lines = [f"🔍 *Results for '{query}':*\n"]
                 for e in emails:
-                    lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
+                    if e.get('sender'):
+                        lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
+                    else:
+                        lines.append(f"`{e['idx']}.` *{e.get('title', e.get('subject',''))[:60]}*")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "web_search":

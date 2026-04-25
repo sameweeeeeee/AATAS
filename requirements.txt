@@ -23,3 +23,6 @@ joblib>=1.3.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+#search engine
+ddgs>=9.14.1

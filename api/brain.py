@@ -915,6 +915,13 @@ class AATASBrain:
                 if s_text.lower().strip("?") in ["search", "find", "results", "any results"]:
                     predictions.append(("search", 0.7))
 
+            # Short acknowledgements — map to chat_thanks
+            ack_words = {"ok", "okay", "alright", "aight", "got it", "sure", "cool",
+                        "noted", "ight", "k", "kk", "roger", "understood", "nice",
+                        "sounds good", "makes sense", "perfect", "great", "awesome"}
+            if s_text.lower().strip().rstrip("!.~ ") in ack_words:
+                predictions.append(("chat_thanks", 0.85))
+
             # Heuristic for 'web_search' intent
             if not any(p[0] == "web_search" for p in predictions):
                 # Only add web_search if we don't already have a strong chat intent
