@@ -9,6 +9,7 @@ mkdir -p logs data
 
 # load env
 export $(grep -v '^#' .env | xargs)
+export PYTHONPATH="$PROJECT_ROOT"
 
 echo "Running from: $(pwd)"
 

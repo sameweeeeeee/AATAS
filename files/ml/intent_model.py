@@ -24,7 +24,7 @@ DATA_PATH  = "data/intent_training_data.pkl"
 
 # All supported intents
 INTENTS = [
-    "fetch_inbox", "fetch_priority", "analyse", "archive", "label",
+    "fetch_inbox", "fetch_priority", "analyse", "search", "archive", "label",
     "trash", "reply", "compose", "create_rule", "delete_rule", "list_rules",
     "list_history", "none",
     "chat_greeting", "chat_how_are_you", "chat_identity", "chat_thanks", "chat_goodbye"

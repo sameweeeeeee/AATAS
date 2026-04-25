@@ -33,7 +33,7 @@ from api.brain import AATASBrain
 from api.gmail_auth import get_auth_url, get_gmail_service
 from api.gmail_ops import (
     archive_email, apply_label, apply_rules, fetch_emails,
-    mark_read, send_reply, trash_email, send_new_email,
+    mark_read, send_reply, trash_email, send_new_email, search_emails,
 )
 from db.database import (
     ActionLog, AutomationRule, SessionLocal,
@@ -91,6 +91,7 @@ _INTENT_LABELS = [
     ("📬 Fetch Inbox",    "fetch_inbox"),
     ("⭐ Fetch Priority", "fetch_priority"),
     ("🔍 Analyse",        "analyse"),
+    ("🔍 Search",         "search"),
     ("📦 Archive",        "archive"),
     ("🏷️ Label",          "label"),
     ("🗑️ Trash",          "trash"),
@@ -278,8 +279,8 @@ async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Fetching inbox...")
     try:
         svc    = get_gmail_service(user)
-        emails = fetch_emails(svc, max_results=10)
-        _cache[user.telegram_id] = emails
+        emails = fetch_emails(svc, max_results=20)
+        _cache[user.telegram_id] = emails  # force refresh cache
 
         if not emails:
             await msg.edit_text("📭 No unread emails!")
@@ -295,6 +296,109 @@ async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ {ex}")
     finally:
         db.close()
+
+
+# ── /search ───────────────────────────────────────────────────
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db, user = _get_user(update)
+
+    if not user.setup_complete:
+        await update.message.reply_text("Run /setup first.")
+        db.close()
+        return
+
+    if not ctx.args:
+        await update.message.reply_text("Usage: /search <keyword>")
+        db.close()
+        return
+
+    keyword = " ".join(ctx.args)
+
+    msg = await update.message.reply_text(f"🔍 Searching for '{keyword}'...")
+
+    try:
+        svc = get_gmail_service(user)
+        # Check for date filters in keywords
+        query = keyword
+        emails = search_emails(svc, query, max_results=20)
+        
+        if not emails:
+            await msg.edit_text("No results found.")
+            return
+
+        # Perform semantic ranking if it's a natural language query
+        if len(keyword.split()) > 1:
+            ranked = brain.semantic_search(keyword, emails, top_n=10)
+            if ranked:
+                emails = ranked
+
+        _cache[user.telegram_id] = emails
+
+        lines = [f"🔍 *Results for '{keyword}':*\n"]
+        for e in emails:
+            lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as ex:
+        await msg.edit_text(f"❌ {ex}")
+    finally:
+        db.close()
+
+
+# ── /mute ───────────────────────────────────────────────────
+
+async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db, user = _get_user(update)
+    upsert_memory(db, user.id, "mute_automations", "true")
+    db.close()
+    await update.message.reply_text("🔇 *Automations muted.* I'll still run rules, but I won't notify you.", parse_mode="Markdown")
+
+async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db, user = _get_user(update)
+    upsert_memory(db, user.id, "mute_automations", "false")
+    db.close()
+    await update.message.reply_text("🔊 *Automations unmuted.* I'll notify you of automated actions.", parse_mode="Markdown")
+
+
+# ── Auto-Refresh Job ──────────────────────────────────────────
+
+async def job_auto_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """Background task to check inboxes and apply rules."""
+    db = SessionLocal()
+    from db.database import User
+    users = db.query(User).filter_by(setup_complete=True).all()
+    
+    for user in users:
+        try:
+            svc = get_gmail_service(user)
+            # Fetch unread emails
+            emails = fetch_emails(svc, max_results=20, query="is:unread")
+            if not emails:
+                continue
+                
+            rules = get_rules(db, user.id)
+            if not rules:
+                continue
+                
+            applied = apply_rules(svc, db, user.id, emails, rules, brain)
+            
+            if applied:
+                mems = get_memories(db, user.id)
+                if mems.get("mute_automations") == "true":
+                    continue
+
+                count = len(applied)
+                text = f"🤖 *Auto-Automation Applied*\n\nI processed {count} emails based on your rules.\n"
+                for a in applied[:5]:
+                    text += f"• {a['action'].title()}: _{a['email']['subject'][:40]}_\n"
+                
+                await ctx.bot.send_message(user.telegram_id, text, parse_mode="Markdown")
+                
+        except Exception as e:
+            log.error(f"Auto-check failed for user {user.id}: {e}")
+            
+    db.close()
 
 
 # ── /check ────────────────────────────────────────────────────
@@ -317,7 +421,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         svc     = get_gmail_service(user)
         emails  = fetch_emails(svc, max_results=50, query="is:unread")
-        applied = apply_rules(svc, db, user.id, emails, rules)
+        applied = apply_rules(svc, db, user.id, emails, rules, brain)
 
         if not applied:
             await msg.edit_text("✅ Checked inbox — no rules triggered.")
@@ -661,14 +765,35 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     if action == "fetch_inbox":
         brain.record_passive_example(original_text, action)
         if svc:
-            limit = intent.get("email_idx") or 10
-            limit = min(limit, 50)  # Max out at 50 to prevent huge requests
-            emails = fetch_emails(svc, max_results=limit)
+            emails = fetch_emails(svc, max_results=20)
             _cache[tg_id] = emails
             if emails:
                 lines = [f"📬 *Inbox (last {len(emails)}):*\n"]
                 for e in emails:
                     lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}\n")
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "search":
+        brain.record_passive_example(original_text, action)
+        if svc:
+            query = original_text
+            # Remove "search for" or "find" from query
+            import re
+            query = re.sub(r"^(?:search(?:\s+for)?|find(?:\s+emails?\s+about)?)\s+", "", query, flags=re.IGNORECASE).strip()
+            
+            emails = search_emails(svc, query, max_results=20)
+            if not emails:
+                await update.message.reply_text("No results found.")
+            else:
+                # Semantic search integration
+                if len(query.split()) > 1:
+                    ranked = brain.semantic_search(query, emails, top_n=10)
+                    if ranked: emails = ranked
+                
+                _cache[tg_id] = emails
+                lines = [f"🔍 *Results for '{query}':*\n"]
+                for e in emails:
+                    lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "fetch_priority":
@@ -969,10 +1094,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("decline",  cmd_decline))
     app.add_handler(CommandHandler("setup",    cmd_setup))
     app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("search",   cmd_search))
     app.add_handler(CommandHandler("inbox",    cmd_inbox))
     app.add_handler(CommandHandler("check",    cmd_check))
     app.add_handler(CommandHandler("rules",    cmd_rules))
     app.add_handler(CommandHandler("history",  cmd_history))
+    app.add_handler(CommandHandler("mute",     cmd_mute))
+    app.add_handler(CommandHandler("unmute",   cmd_unmute))
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("train",    cmd_train))
     app.add_handler(CommandHandler("done",     cmd_done))
@@ -980,6 +1108,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("priority", cmd_priority_train))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_cb))
+
+    # Schedule auto-refresh job every 2 minutes
+    app.job_queue.run_repeating(job_auto_check, interval=120, first=10)
 
     return app
 
@@ -990,9 +1121,12 @@ async def _set_commands(app: Application):
         BotCommand("accept",   "Accept terms and continue setup"),
         BotCommand("decline",  "Decline terms and exit"),
         BotCommand("setup",    "Connect Gmail"),
+        BotCommand("search",   "Search emails"),
         BotCommand("inbox",    "View inbox"),
         BotCommand("check",    "Apply automation rules"),
         BotCommand("rules",    "Manage rules"),
+        BotCommand("mute",     "Mute automation alerts"),
+        BotCommand("unmute",   "Unmute automation alerts"),
         BotCommand("history",  "View action history"),
         BotCommand("stats",    "View AI model stats"),
         BotCommand("train",    "Enter trainer mode (secret code required)"),

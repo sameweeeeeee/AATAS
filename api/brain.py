@@ -718,6 +718,57 @@ class AATASBrain:
             body = f"Hi {r},\n\nHope you're doing well. {content}\n\nBest regards,"
         return final_subject, body + EMAIL_DISCLAIMER
 
+    def semantic_search(self, query: str, emails: list[dict], top_n: int = 5) -> list[dict]:
+        """
+        Find emails semantically similar to the query using TF-IDF cosine similarity.
+        """
+        if not emails:
+            return []
+
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        # Combine subject and body for search
+        documents = [f"{e['subject']} {e['body']}" for e in emails]
+        
+        # Add query to the list of documents to vectorize together
+        all_texts = [query] + documents
+        
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        
+        # Calculate similarity between query (index 0) and all documents (index 1+)
+        similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+        
+        # Rank and filter
+        ranked_indices = similarities.argsort()[::-1]
+        results = []
+        for idx in ranked_indices:
+            if similarities[idx] > 0.1: # Minimum similarity threshold
+                results.append(emails[idx])
+            if len(results) >= top_n:
+                break
+        
+        return results
+
+    def check_semantic_match(self, rule_description: str, email: dict, threshold: float = 0.35) -> bool:
+        """
+        Check if an email matches a rule description semantically.
+        """
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        doc   = f"{email['subject']} {email['body']}"
+        texts = [rule_description.lower(), doc.lower()]
+        
+        try:
+            vectorizer = TfidfVectorizer(stop_words='english')
+            tfidf      = vectorizer.fit_transform(texts)
+            sim        = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+            return sim >= threshold
+        except Exception:
+            return False
+
     # ── Training helpers ───────────────────────────────────────────────────
 
     def add_intent_example(self, text: str, intent: str):

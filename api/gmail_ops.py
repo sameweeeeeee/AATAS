@@ -65,6 +65,46 @@ def fetch_emails(svc: Resource, max_results: int = 10, query: str = "is:unread")
     return out
 
 
+def search_emails(service, query, max_results=10):
+    # Handle time-based filters like "last 7 days"
+    # Gmail API query format for time: "newer_than:7d"
+    q = query
+    import re
+    m = re.search(r"last (\d+) days", q, re.IGNORECASE)
+    if m:
+        days = m.group(1)
+        q = q.replace(m.group(0), "").strip()
+        q = f"{q} newer_than:{days}d"
+    
+    results = service.users().messages().list(
+        userId="me",
+        q=q,
+        maxResults=max_results
+    ).execute()
+
+    messages = results.get("messages", [])
+    emails = []
+
+    for i, msg in enumerate(messages, start=1):
+        full = service.users().messages().get(userId="me", id=msg["id"]).execute()
+        payload = full.get("payload", {})
+        headers = payload.get("headers", [])
+
+        subject = _header(headers, "Subject") or "(no subject)"
+        sender = _header(headers, "From")
+
+        emails.append({
+            "id": msg["id"],
+            "idx": i,
+            "subject": subject,
+            "sender": sender,
+            "body": _clean(_extract_body(payload)),
+            "date": _header(headers, "Date")
+        })
+
+    return emails
+
+
 # ── Actions ────────────────────────────────────────
 
 def archive_email(svc: Resource, msg_id: str):
@@ -129,26 +169,50 @@ def send_new_email(svc: Resource, to_address: str, subject: str, body: str):
 
 # ── Rule engine ────────────────────────────────────
 
-def _email_matches_rule(email: dict, rule: AutomationRule) -> bool:
-    """Check if an email satisfies a rule's target conditions."""
+def _email_matches_rule(email: dict, rule: AutomationRule, brain: Optional[object] = None) -> bool:
+    """
+    Robust rule matching engine.
+    Supports:
+    - Multiple keywords (OR matching)
+    - Regex patterns (e.g. "regex:.*invoice.*")
+    - Case-insensitive sender contains
+    """
     target = rule.get_target()
-    text   = (email["subject"] + " " + email["body"] + " " + email["sender"]).lower()
+    text   = (email["subject"] + " " + email["body"]).lower()
+    sender = email["sender"].lower()
 
-    # keyword matching — any keyword must appear anywhere in subject/body/sender
-    keywords = [k for k in target.get("keywords", []) if k.strip()]
-    if keywords and not any(kw.lower() in text for kw in keywords):
+    # 1. Sender matching (priority)
+    sender_filter = target.get("from", "").strip().lower()
+    if sender_filter and sender_filter not in sender:
         return False
 
-    # sender matching
-    sender_filter = target.get("from", "").strip()
-    if sender_filter and sender_filter.lower() not in email["sender"].lower():
+    # 2. Keyword/Regex matching
+    keywords = [k.strip() for k in target.get("keywords", []) if k.strip()]
+    matched = False
+    if keywords:
+        for kw in keywords:
+            if kw.lower().startswith("regex:"):
+                pattern = kw[6:].strip()
+                try:
+                    if re.search(pattern, text, re.IGNORECASE) or re.search(pattern, sender, re.IGNORECASE):
+                        matched = True; break
+                except Exception:
+                    pass # ignore invalid regex
+            elif kw.lower() in text:
+                matched = True; break
+    
+    # 3. Semantic matching (fallback if keywords didn't match or were empty)
+    if not matched and brain and hasattr(brain, "check_semantic_match"):
+        # We only do semantic matching if it's a reasonably long rule description
+        if len(rule.rule_text.split()) > 3:
+            matched = brain.check_semantic_match(rule.rule_text, email)
+
+    # safety: require at least one condition to have been met (keywords, sender, or semantic)
+    # If we have no keywords and no sender filter, semantic is the ONLY way to match.
+    if not matched and not sender_filter:
         return False
 
-    # safety: require at least one condition to be set (prevents matching ALL emails)
-    if not keywords and not sender_filter:
-        return False
-
-    return True
+    return matched or (sender_filter != "")
 
 def apply_rules(
     svc:     Resource,
@@ -156,6 +220,7 @@ def apply_rules(
     user_id: int,
     emails:  list[dict],
     rules:   list[AutomationRule],
+    brain:   Optional[object] = None,
 ) -> list[dict]:
     """
     Run all user rules against a list of emails.
@@ -164,7 +229,7 @@ def apply_rules(
     applied = []
     for email in emails:
         for rule in rules:
-            if not _email_matches_rule(email, rule):
+            if not _email_matches_rule(email, rule, brain):
                 continue
 
             action = rule.action
