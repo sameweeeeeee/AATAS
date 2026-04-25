@@ -93,6 +93,12 @@ def _detect_style(text: str, memories: dict[str, str] = None) -> str:
     return "casual"
 
 
+def _normalize_text(text: str) -> str:
+    """Collapse repeated characters (3+ consecutive) down to 2 to improve ML matching."""
+    # "hiii" -> "hii", "hellooo" -> "helloo"
+    return re.sub(r'(.)\1{2,}', r'\1\1', text)
+
+
 def _blend_style(db: Session, user_id: int, current: str) -> str:
     """Update the per-user style count in Memory and return the dominant style."""
     mems    = get_memories(db, user_id)
@@ -597,8 +603,8 @@ _RESPONSES: dict[str, dict[str, list[str]]] = {
         "casual": [
             "Hello! How can I help you today? 👋",
             "Hi there! Ready to tackle your inbox whenever you are.",
-            "Hey! Need a hand with your emails?",
-            "Hello! I'm here to help you manage your mail.",
+            "Hey! Need a hand?",
+            "Hello! I'm here to help you today.",
         ],
         "formal": [
             "Hello! How can I assist you today?",
@@ -838,9 +844,22 @@ class AATASBrain:
         current_email_idx = resolve_email_index(text, cached, conv_history)
 
         for s_text in sentences:
-            predictions = self.intent_model.predict_multi(s_text, threshold=0.25)
+            s_norm = _normalize_text(s_text)
+            predictions = self.intent_model.predict_multi(s_norm, threshold=0.25)
             
             # ── Apply heuristics to each sentence ───────────────────────────
+
+            # Heuristic for 'chat_greeting'
+            if not any(p[0] == "chat_greeting" for p in predictions):
+                # Standard and collapsed forms (e.g. hello -> helo, wassup -> wasup)
+                greetings = {
+                    "hi", "hello", "helo", "hey", "wassup", "wasup", "sup", "yo", "hiya", "greetings", "greet"
+                }
+                s_low = s_norm.lower().strip("!? ")
+                # Even more aggressive collapse for checking vs greeting list
+                s_collapsed = re.sub(r'(.)\1+', r'\1', s_low)
+                if s_collapsed in greetings or any(k in s_low for k in ["good morning", "good afternoon", "good evening"]):
+                    predictions.append(("chat_greeting", 0.9))
             
             # Heuristic for 'recall' intent
             if not any(p[0] == "recall" for p in predictions):
