@@ -1,17 +1,19 @@
 # AATAS — An AI-Assisted Technological Arrangement System
 
-> Smart Gmail management via Telegram. Talk naturally. AATAS remembers, learns, and acts.
+> **Now with JARVIS Protocol.** Your personal, private, and local AI digital butler.
+> Smart Gmail management and global research via Telegram.
 
 ---
 
 ## What AATAS does
 
-- 💬 **Conversational AI** — just talk to it. "Archive anything about Google Classroom", "show my urgent emails", "draft a reply to email 3"
-- 🤖 **Persistent rules** — set rules once, they run forever. AATAS remembers every instruction.
-- 👥 **Multi-user** — anyone can connect their own Gmail via a self-service /setup flow
-- 📊 **AI analysis** — priority classification, summarisation, action item extraction, reply drafting
-- 📋 **Action history** — audit log of everything AATAS has done to your inbox
-- ✅ **Inline buttons** — one-tap archive, label, and mark-read from Telegram
+- 🧠 **Local ML Brain** — 100% private. No external AI APIs (no Claude, no OpenAI). Runs entirely on your hardware.
+- 🤵 **JARVIS Personality** — Professional, articulate, and efficient. Talk to it like Tony Stark's assistant.
+- 🌐 **Research Module** — Scans the web (DuckDuckGo) and summarizes articles locally using built-in NLP.
+- 💬 **Conversational Memory** — Remembers facts about you ("My name is Tony", "I live in Malibu") and uses them in context.
+- 🤖 **Persistent Rules** — Set automation rules once (e.g., "archive anything about Google Classroom").
+- 📊 **Email Analysis** — Priority classification, TF-IDF summarisation, and draft generation.
+- ✅ **Inline Actions** — One-tap archive, label, and mark-read directly from Telegram.
 
 ---
 
@@ -21,9 +23,11 @@
 User on Telegram
      │
      ▼
-bot/aatas_bot.py          ← Telegram bot (Python, python-telegram-bot)
+bot/aatas_bot.py          ← Telegram bot (Python)
      │
-     ├── api/brain.py     ← Claude AI (Anthropic API) — understands intent
+     ├── api/brain.py     ← Local ML Brain (TF-IDF + MLP) — understands intent
+     │    ├── memory_guesser.py ← Passive learning & fact extraction
+     │    └── web_ops.py        ← Web searching & scraping
      ├── api/gmail_ops.py ← Gmail read/write (Google API)
      ├── api/gmail_auth.py← Per-user OAuth flow
      └── db/database.py   ← SQLite: users, rules, memory, history
@@ -33,181 +37,93 @@ api/server.py             ← FastAPI (OAuth callback endpoint)
 
 ---
 
+## JARVIS Mode — How to Use
+
+AATAS is now configured with the **JARVIS Protocol**.
+
+### 1. Activating Tone
+The bot automatically mirrors your style, but you can force JARVIS mode by:
+- Addressing it as **"Jarvis"** or **"Sir"**.
+- Saying **"Jarvis mode"** or **"Be Jarvis"**.
+
+### 2. Web Research
+You can now ask AATAS to find information outside your inbox:
+- **Search**: `"Jarvis, look up the latest SpaceX news"` or `"Find information on Python 3.12 features"`
+- **Analyse**: After a search, say `"research 1"` to have Jarvis read and summarize the first result.
+- **Direct Link**: `"research https://example.com"` to get a summary of any URL.
+
+### 3. Passive Learning
+AATAS listens to what you say and remembers facts:
+- `"Jarvis, remember that my office address is 123 Stark Tower."`
+- `"Who am I?"` → *"You are Tony, Sir. And I recall you work at Stark Industries."*
+
+---
+
 ## Setup Guide
 
 ### Step 1 — Prerequisites
+- Python 3.11+
+- Public domain or IP address (for Gmail OAuth callback)
+- Telegram Bot Token (from @BotFather)
 
-- Python 3.11+ or Docker
-- A **DigitalOcean Droplet** (2GB RAM minimum) — not Vercel (see note below)
-- Public domain or IP address for OAuth redirect
+### Step 2 — Google Cloud / Gmail
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create project "AATAS" and enable **Gmail API**.
+3. Configure **OAuth consent screen** (External, add scopes: `gmail.modify`, `userinfo.email`).
+4. Create **OAuth 2.0 Client ID** (Web application).
+5. Add Redirect URI: `https://YOUR_DOMAIN/oauth/callback`
+6. Download JSON → rename to `credentials.json` → place in project root.
 
-> ⚠️ **Why not Vercel?** Gmail OAuth requires a persistent redirect URI, and the
-> Telegram bot needs long-polling or a persistent process. Vercel's serverless
-> functions timeout in 10s and have no persistent state. Use DigitalOcean, Railway,
-> Render, or any VPS.
-
----
-
-### Step 2 — Anthropic API Key
-
-1. Go to https://console.anthropic.com/
-2. Create an API key
-3. Save it — you'll need it in your `.env`
-
----
-
-### Step 3 — Google Cloud / Gmail
-
-1. Go to https://console.cloud.google.com/
-2. Create a new project → name it "AATAS"
-3. Enable **Gmail API** (search APIs & Services → Library)
-4. Go to **APIs & Services → OAuth consent screen**
-   - User type: External
-   - App name: AATAS
-   - Add scopes: `gmail.readonly`, `gmail.modify`, `gmail.labels`, `userinfo.email`
-5. Go to **Credentials → Create Credentials → OAuth 2.0 Client ID**
-   - Application type: **Web application**
-   - Authorised redirect URIs: `https://YOUR_DOMAIN/oauth/callback`
-6. Download JSON → rename to `credentials.json` → place in project root
-
----
-
-### Step 4 — Telegram Bot
-
-1. Message **@BotFather** on Telegram
-2. `/newbot` → choose a name → choose username (e.g. `aatas_bot`)
-3. Copy the bot token
-4. (Optional) Set bot description: `/setdescription` → "AATAS — AI Gmail manager"
-5. Set commands: `/setcommands` then paste:
-   ```
-   start - Start AATAS
-   setup - Connect your Gmail
-   inbox - View inbox
-   check - Apply automation rules
-   rules - Manage rules
-   history - Recent actions
-   help - Help
-   ```
-
----
-
-### Step 5 — Configure Environment
-
+### Step 3 — Configure Environment
 ```bash
 cp .env.example .env
 ```
+Edit `.env` and fill in `TELEGRAM_BOT_TOKEN`, `OAUTH_REDIRECT_URI`, etc. **Note: No Anthropic/OpenAI keys are required.**
 
-Edit `.env`:
-```
-ANTHROPIC_API_KEY=sk-ant-...
-TELEGRAM_BOT_TOKEN=7123456789:AAF...
-GOOGLE_CREDENTIALS_FILE=credentials.json
-OAUTH_REDIRECT_URI=https://your-server.com/oauth/callback
-DB_PATH=data/aatas.db
-```
-
----
-
-### Step 6 — Deploy on DigitalOcean
-
+### Step 4 — Run
 ```bash
-# On your Droplet (Ubuntu 22.04+)
+# Install dependencies
+pip install -r requirements.txt
 
-# Install Docker
-curl -fsSL https://get.docker.com | sh
-
-# Clone repo
-git clone https://github.com/you/aatas
-cd aatas
-
-# Add your credentials
-nano .env                   # fill in values
-nano credentials.json       # paste your Google OAuth JSON
-
-# Run
-docker-compose up -d --build
-
-# Check logs
-docker-compose logs -f
+# Launch AATAS
+./files/launch_aatas.sh
 ```
-
-For HTTPS (required for OAuth), use nginx + certbot:
-```bash
-apt install nginx certbot python3-certbot-nginx
-certbot --nginx -d your-domain.com
-# Edit nginx config to proxy port 80/443 → 8000
-```
-
----
-
-### Step 7 — First Use
-
-1. Open Telegram → find your bot → `/start`
-2. Tap `/setup` → tap "Connect Gmail" button → authorise on Google
-3. You'll see "✅ Gmail Connected!" in Telegram
-4. Start talking:
-   - `"show my inbox"`
-   - `"archive anything about Google Classroom"`
-   - `"what are my most urgent emails?"`
-   - `"analyse email 2"`
 
 ---
 
 ## Example Conversations
 
 ```
-You: archive anything about promotions or newsletters
-AATAS: Done! I've created a rule to automatically archive emails that mention 
-       promotions, newsletters, or unsubscribe links. It'll run every time 
-       you do /check. Want me to apply it to your inbox now?
-
-You: yes
-AATAS: Applied! Archived 8 emails matching your rule.
+You: Jarvis, show my inbox
+AATAS: Scanning the frequencies now, Sir. Your inbox is displayed.
 
 ---
 
-You: what rules do i have?
-AATAS: You have 2 active rules:
-       [1] ARCHIVE — archive anything about promotions or newsletters (triggered 8×)
-       [2] LABEL — label emails from boss@work.com as "urgent" (triggered 3×)
+You: look up the current price of Bitcoin
+AATAS: Accessing the internet protocols, Sir. Searching for the requested data...
+       [1] Bitcoin Price Index — $65,000...
+       [2] BTC Live Market Cap...
+       Shall I research one of these in detail? Say "research 1".
 
 ---
 
-You: draft a casual reply to email 4
-AATAS: Here's a casual draft:
-       "Hey! Thanks for reaching out — I'll take a look and get back to you 
-       by end of week. Cheers!"
-       [Send] [Cancel]
+You: archive anything about promotions
+AATAS: Protocol established, Sir. I have set a permanent watch for those conditions.
 ```
+
+---
+
+## Security & Privacy
+- **100% Local**: Your messages never leave your server for "AI processing."
+- **Encrypted Tokens**: Gmail OAuth tokens are stored securely.
+- **Private Butler**: Jarvis only learns from *your* conversations.
 
 ---
 
 ## File Structure
-
-```
-aatas/
-├── bot/
-│   └── aatas_bot.py          # Telegram bot — main entry point
-├── api/
-│   ├── server.py             # FastAPI — OAuth callback
-│   ├── brain.py              # Claude AI conversation layer
-│   ├── gmail_auth.py         # Per-user Gmail OAuth
-│   └── gmail_ops.py          # Gmail read/write + rule engine
-├── db/
-│   └── database.py           # SQLite: users, rules, memory, history
-├── data/                     # DB and exports (gitignored)
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-└── .env.example
-```
-
----
-
-## Security
-
-- Each user's Gmail token is stored encrypted in the DB — never shared
-- The bot responds to anyone by default; to restrict to specific users,
-  add a `TELEGRAM_USER_ID=12345` env var (comma-separated for multiple)
-- All OAuth flows use Google's secure PKCE flow
-- `credentials.json` and `.env` are gitignored — never commit them
+- `bot/aatas_bot.py`: Main Telegram interface.
+- `api/brain.py`: Intent recognition & JARVIS persona.
+- `api/memory_guesser.py`: The "Guessing Engine" for passive learning.
+- `api/web_ops.py`: Web searching and scraping.
+- `api/gmail_ops.py`: Gmail integration and automation rules.
+- `files/ml/`: Training data and model logic.

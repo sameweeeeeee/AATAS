@@ -28,6 +28,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
+from telegram.helpers import escape_markdown
 
 from api.brain import AATASBrain
 from api.gmail_auth import get_auth_url, get_gmail_service
@@ -35,6 +36,7 @@ from api.gmail_ops import (
     archive_email, apply_label, apply_rules, fetch_emails,
     mark_read, send_reply, trash_email, send_new_email, search_emails,
 )
+from api.web_ops import search_web, scrape_page
 from db.database import (
     ActionLog, AutomationRule, SessionLocal,
     add_rule, get_or_create_user, get_rules, log_action, upsert_memory, get_memories,
@@ -131,7 +133,8 @@ def _cached(tg_id: int, n: int) -> Optional[dict]:
     return emails[n - 1] if 1 <= n <= len(emails) else None
 
 async def _typing(update: Update):
-    await update.effective_chat.send_action("typing")
+    if update.effective_chat:
+        await update.effective_chat.send_action("typing")
 
 def _intent_keyboard() -> InlineKeyboardMarkup:
     rows = []
@@ -151,6 +154,11 @@ def _priority_keyboard() -> InlineKeyboardMarkup:
         for label, cb in _PRIORITY_LABELS
     ]])
 
+def _esc(text) -> str:
+    """Escape text for Telegram legacy Markdown (v1)."""
+    if text is None: return ""
+    return escape_markdown(str(text), version=1)
+
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -169,7 +177,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.setup_complete:
         db.close()
         await update.message.reply_text(
-            f"👋 Welcome back, *{name}*!\n\n"
+            f"👋 Welcome back, *{_esc(name)}*!\n\n"
             "I'm AATAS — your self-trained AI Gmail manager.\n"
             "Just talk to me naturally — I understand what you need.\n\n"
             "Try: _\"show my inbox\"_ or _\"archive anything about promotions\"_\n\n"
@@ -276,10 +284,11 @@ async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please run /setup first to connect Gmail.")
         db.close(); return
 
+    await _typing(update)
     msg = await update.message.reply_text("⏳ Fetching inbox...")
     try:
         svc    = get_gmail_service(user)
-        emails = fetch_emails(svc, max_results=20)
+        emails = fetch_emails(svc, max_results=20, query="is:unread")
         _cache[user.telegram_id] = emails  # force refresh cache
 
         if not emails:
@@ -288,7 +297,7 @@ async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         lines = ["📬 *Your unread inbox:*\n"]
         for e in emails:
-            lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}\n")
+            lines.append(f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n   👤 {_esc(e['sender'][:35])}\n")
         lines.append("\n_Say \"analyse 3\" or \"archive 2\" to take action._")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
@@ -315,6 +324,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     keyword = " ".join(ctx.args)
 
+    await _typing(update)
     msg = await update.message.reply_text(f"🔍 Searching for '{keyword}'...")
 
     try:
@@ -335,9 +345,9 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         _cache[user.telegram_id] = emails
 
-        lines = [f"🔍 *Results for '{keyword}':*\n"]
+        lines = [f"🔍 *Results for '{_esc(keyword)}':*\n"]
         for e in emails:
-            lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
+            lines.append(f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n   👤 {_esc(e['sender'][:35])}")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
     except Exception as ex:
@@ -391,7 +401,7 @@ async def job_auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                 count = len(applied)
                 text = f"🤖 *Auto-Automation Applied*\n\nI processed {count} emails based on your rules.\n"
                 for a in applied[:5]:
-                    text += f"• {a['action'].title()}: _{a['email']['subject'][:40]}_\n"
+                    text += f"• {a['action'].title()}: _{_esc(a['email']['subject'][:40])}_\n"
                 
                 await ctx.bot.send_message(user.telegram_id, text, parse_mode="Markdown")
                 
@@ -417,6 +427,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         db.close(); return
 
+    await _typing(update)
     msg = await update.message.reply_text(f"⏳ Checking inbox against {len(rules)} rules...")
     try:
         svc     = get_gmail_service(user)
@@ -428,7 +439,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             lines = [f"✅ *AATAS applied {len(applied)} actions:*\n"]
             for a in applied[:10]:
-                lines.append(f"• {a['action'].title()}: _{a['email']['subject'][:45]}_")
+                lines.append(f"• {a['action'].title()}: _{_esc(a['email']['subject'][:45])}_")
             if len(applied) > 10:
                 lines.append(f"...and {len(applied)-10} more.")
             await msg.edit_text("\n".join(lines), parse_mode="Markdown")
@@ -459,7 +470,7 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["⚙️ *Your automation rules:*\n"]
     for r in rules:
         lines.append(
-            f"`[{r.id}]` {r.action.upper()} — _{r.rule_text}_\n"
+            f"`[{r.id}]` {r.action.upper()} — _{_esc(r.rule_text)}_\n"
             f"   Triggered {r.trigger_count}× since {r.created_at.strftime('%d %b')}\n"
         )
     lines.append("\n_Say \"delete rule 3\" to remove a rule._")
@@ -485,7 +496,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Recent AATAS actions:*\n"]
     for l in logs:
         ts = l.created_at.strftime("%d %b %H:%M")
-        lines.append(f"`{ts}` {l.action.upper()} — _{l.email_subject[:45]}_")
+        lines.append(f"`{ts}` {l.action.upper()} — _{_esc(l.email_subject[:45])}_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -561,6 +572,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    await _typing(update)
     msg = await update.message.reply_text(f"🧠 Retraining on {added} new examples... please wait...")
     try:
         stats = brain.retrain()
@@ -573,9 +585,9 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Intent Model: `{i.get('error', 'Not enough data yet')}`"
         )
         priority_line = (
-            f"Priority Model: trained on `{p['examples']}` examples"
+            f"Priority Model: trained on `{_esc(p['examples'])}` examples"
             if "examples" in p and "error" not in p else
-            f"Priority Model: {p.get('error', 'Using heuristics')}"
+            f"Priority Model: {_esc(p.get('error', 'Using heuristics'))}"
         )
 
         await msg.edit_text(
@@ -617,6 +629,7 @@ async def cmd_priority_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     _trainer[tg_id]["mode"] = "priority"
 
+    await _typing(update)
     msg = await update.message.reply_text("⏳ Fetching emails for priority training...")
     try:
         svc    = get_gmail_service(user)
@@ -638,8 +651,8 @@ async def cmd_priority_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for e in emails:
             await update.message.reply_text(
-                f"📧 *{e['subject'][:50]}*\n"
-                f"👤 {e['sender'][:40]}\n\n"
+                f"📧 *{_esc(e['subject'][:50])}*\n"
+                f"👤 {_esc(e['sender'][:40])}\n\n"
                 "_How urgent is this email?_",
                 parse_mode="Markdown",
                 reply_markup=_priority_keyboard(),
@@ -660,8 +673,9 @@ async def _handle_trainer_message(update: Update, ctx, tg_id: int, text: str):
 
     # Store the example and show intent buttons
     state["pending"] = text
+    await _typing(update)
     await update.message.reply_text(
-        f"📝 *New example received:*\n`{text}`\n\n"
+        f"📝 *New example received:*\n`{_esc(text)}`\n\n"
         "What should this command do? Tap the correct intent below:",
         parse_mode="Markdown",
         reply_markup=_intent_keyboard(),
@@ -746,7 +760,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as ex:
         log.exception("handle_message error")
-        await update.message.reply_text(f"❌ Something went wrong: {ex}")
+        await update.message.reply_text(f"❌ Something went wrong: {_esc(str(ex))}")
     finally:
         db.close()
 
@@ -765,12 +779,19 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     if action == "fetch_inbox":
         brain.record_passive_example(original_text, action)
         if svc:
-            emails = fetch_emails(svc, max_results=20)
+            # If user explicitly said "unread", use that filter.
+            # Otherwise, use the new permissive default from gmail_ops.
+            query = "-in:trash -in:spam"
+            if "unread" in original_text.lower():
+                query = "is:unread"
+            
+            emails = fetch_emails(svc, max_results=20, query=query)
             _cache[tg_id] = emails
             if emails:
-                lines = [f"📬 *Inbox (last {len(emails)}):*\n"]
+                title = "Unread Inbox" if "unread" in query else "Latest Emails"
+                lines = [f"📬 *{title} (last {len(emails)}):*\n"]
                 for e in emails:
-                    lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}\n")
+                    lines.append(f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n   👤 {_esc(e['sender'][:35])}\n")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "search":
@@ -782,6 +803,11 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
             query = re.sub(r"^(?:search(?:\s+for)?|find(?:\s+emails?\s+about)?)\s+", "", query, flags=re.IGNORECASE).strip()
             
             emails = search_emails(svc, query, max_results=20)
+            
+            if not query or query == "?":
+                await update.message.reply_text("What would you like me to search for, Sir? (e.g. _'search for invoice'_)")
+                return
+
             if not emails:
                 await update.message.reply_text("No results found.")
             else:
@@ -796,11 +822,71 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
                     lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+    elif action == "web_search":
+        brain.record_passive_example(original_text, action)
+        import re
+        query = original_text
+        query = re.sub(r"^(?:search(?:\s+for)?|look\s+up|find(?:\s+info(?:rmation)?\s+on)?)\s+", "", query, flags=re.IGNORECASE).strip()
+        query = query.rstrip("?")
+        
+        if not query:
+            await update.message.reply_text("What would you like me to search for, Sir?")
+            return
+
+        msg = await update.message.reply_text(f"🌐 Searching for '{query}'...")
+        results = search_web(query, max_results=5)
+        
+        if not results:
+            await msg.edit_text("I'm sorry, Sir. My search returned no relevant results.")
+        else:
+            lines = [f"🌐 *Web Search Results for '{query}':*\n"]
+            cache_data = []
+            for i, r in enumerate(results, 1):
+                lines.append(f"`{i}.` *{r['title']}*\n   _{r['snippet'][:150]}..._")
+                cache_data.append({"idx": i, "url": r["link"], "title": r["title"], "subject": r["title"]})
+            
+            lines.append("\n_Shall I research one of these in detail? Say \"research 1\"._")
+            await msg.edit_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+            _cache[tg_id] = cache_data
+
+    elif action == "research":
+        brain.record_passive_example(original_text, action)
+        import re
+        m = re.search(r"research\s+(\d+)", original_text.lower())
+        url = ""
+        title = ""
+        if m:
+            target_idx = int(m.group(1))
+            cached = _cache.get(tg_id, [])
+            target = next((c for c in cached if c.get("idx") == target_idx), None)
+            if target:
+                url = target.get("url")
+                title = target.get("title")
+        
+        if not url:
+            # Try to extract URL directly
+            m = re.search(r"https?://[^\s]+", original_text)
+            if m: url = m.group(0)
+            
+        if not url:
+            await update.message.reply_text("Please specify which result to research (e.g., 'research 1') or provide a URL, Sir.")
+            return
+
+        msg = await update.message.reply_text(f"🧠 Researching: {title or url}...")
+        content = scrape_page(url)
+        if not content or len(content) < 100:
+            await msg.edit_text("I'm afraid I couldn't access significant data from that page, Sir. It might be protected or empty.")
+            return
+            
+        summary = brain.summarise_email(title or "Research", content)
+        await msg.edit_text(f"📑 *Research Summary: {_esc(title or 'Report')}*\n\n{_esc(summary)}\n\n🔗 {url}", parse_mode="Markdown")
+
     elif action == "fetch_priority":
         brain.record_passive_example(original_text, action)
         if svc:
             limit = intent.get("email_idx") or 15
             limit = min(limit, 50)
+            await _typing(update)
             emails = fetch_emails(svc, max_results=limit)
             _cache[tg_id] = emails
             scored = []
@@ -823,6 +909,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
                 f"Email #{idx} not in cache. Say _'show my inbox'_ first.",
                 parse_mode="Markdown",
             ); return
+        await _typing(update)
         msg      = await update.message.reply_text("🧠 Analysing...")
         priority, conf = brain.classify_priority(e["subject"], e["body"])
         summary  = brain.summarise_email(e["subject"], e["body"])
@@ -830,17 +917,20 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         draft    = brain.draft_reply(e["subject"], e["body"])
         icon     = PRIORITY_ICON.get(priority, "•")
         text = (
-            f"📧 *{e['subject'][:50]}*\n"
-            f"👤 {e['sender']}\n\n"
-            f"Priority: {icon} `{priority}` ({conf:.0%})\n\n"
-            f"📝 *Summary:*\n{summary}\n\n"
-            f"✅ *Action items:*\n" + ("\n".join(f"• {a}" for a in actions) or "None") +
-            f"\n\n💬 *Draft reply:*\n_{draft}_"
+            f"📧 *{_esc(e['subject'][:50])}*\n"
+            f"👤 {_esc(e['sender'])}\n\n"
+            f"Priority: {icon} `{_esc(priority)}` ({conf:.0%})\n\n"
+            f"📝 *Summary:*\n{_esc(summary)}\n\n"
+            f"✅ *Action items:*\n" + ("\n".join(f"• {_esc(a)}" for a in actions) or "None") +
+            f"\n\n💬 *Draft reply:*\n_{_esc(draft)}_"
         )
-        kbd = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📤 Archive", callback_data=f"archive:{e['id']}"),
-            InlineKeyboardButton("✅ Mark read", callback_data=f"markread:{e['id']}"),
-        ]])
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Send Draft", callback_data=f"sendreply:{e['id']}:{idx}")],
+            [
+                InlineKeyboardButton("📤 Archive", callback_data=f"archive:{e['id']}"),
+                InlineKeyboardButton("✅ Mark read", callback_data=f"markread:{e['id']}"),
+            ]
+        ])
         await msg.edit_text(text, parse_mode="Markdown", reply_markup=kbd)
 
     elif action == "archive" and idx:
@@ -848,16 +938,18 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         e = _cached(tg_id, idx)
         if not e or not svc: return
         archive_email(svc, e["id"])
+        brain.record_passive_priority_example(e["subject"], e["body"], action)
         log_action(db, user.id, "archive", e["id"], e["subject"], "manual")
-        await update.message.reply_text(f"📦 Archived: _{e['subject']}_", parse_mode="Markdown")
+        await update.message.reply_text(f"📦 Archived: _{_esc(e['subject'])}_", parse_mode="Markdown")
 
     elif action == "trash" and idx:
         brain.record_passive_example(original_text, action)
         e = _cached(tg_id, idx)
         if not e or not svc: return
         trash_email(svc, e["id"])
+        brain.record_passive_priority_example(e["subject"], e["body"], action)
         log_action(db, user.id, "trash", e["id"], e["subject"], "manual")
-        await update.message.reply_text(f"🗑 Trashed: _{e['subject']}_", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑 Trashed: _{_esc(e['subject'])}_", parse_mode="Markdown")
 
     elif action == "label" and idx:
         brain.record_passive_example(original_text, action)
@@ -865,9 +957,10 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         label_name = intent.get("action_params", {}).get("label", "labelled")
         if not e or not svc: return
         apply_label(svc, e["id"], label_name)
+        brain.record_passive_priority_example(e["subject"], e["body"], action)
         log_action(db, user.id, "label", e["id"], e["subject"], label_name)
         await update.message.reply_text(
-            f"🏷️ Labelled email #{idx} as *{label_name}*!", parse_mode="Markdown"
+            f"🏷️ Labelled email #{idx} as *{_esc(label_name)}*!", parse_mode="Markdown"
         )
 
     elif action == "reply" and idx:
@@ -875,6 +968,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         e    = _cached(tg_id, idx)
         tone = intent.get("action_params", {}).get("tone", "professional")
         if not e: return
+        brain.record_passive_priority_example(e["subject"], e["body"], action)
         draft = brain.draft_reply(e["subject"], e["body"], tone)
         kbd = InlineKeyboardMarkup([[
             InlineKeyboardButton("📤 Send this reply", callback_data=f"sendreply:{e['id']}:{idx}"),
@@ -953,7 +1047,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
             if rule:
                 rule.enabled = False
                 db.commit()
-                await update.message.reply_text(f"🗑 Rule `{rule_id}` deleted.", parse_mode="Markdown")
+                await update.message.reply_text(f"🗑 Rule `{_esc(rule_id)}` deleted.", parse_mode="Markdown")
 
     elif action == "list_rules":
         brain.record_passive_example(original_text, action)
@@ -963,7 +1057,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         else:
             lines = ["⚙️ *Active rules:*\n"]
             for r in rules:
-                lines.append(f"`[{r.id}]` {r.action.upper()} — _{r.rule_text}_ ({r.trigger_count}×)")
+                lines.append(f"`[{r.id}]` {r.action.upper()} — _{_esc(r.rule_text)}_ ({r.trigger_count}×)")
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "list_history":
@@ -977,7 +1071,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         else:
             lines = ["📋 *Recent actions:*\n"]
             for l in logs:
-                lines.append(f"• {l.action.upper()}: _{l.email_subject[:40]}_")
+                lines.append(f"• {l.action.upper()}: _{_esc(l.email_subject[:40])}_")
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -991,6 +1085,7 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db, user = _get_user(update)
 
     try:
+        await _typing(update)
         # ── Trainer intent labelling ──────────────────────────
         if data.startswith("train_intent:"):
             intent_label = data.split(":", 1)[1]
@@ -1015,7 +1110,7 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             state["pending"] = None
             await q.edit_message_text(
                 f"✅ *Learned!*\n\n"
-                f"`{pending}` → *{intent_label}*\n\n"
+                f"`{_esc(pending)}` → *{_esc(intent_label)}*\n\n"
                 f"Total new examples this session: *{state['added']}*\n\n"
                 "Keep teaching me! Send another example, or\n"
                 "/done — save & retrain | /skip — skip | /stats — model info",
@@ -1034,7 +1129,7 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 state["added"] += 1
                 state["pending_email"] = None
                 await q.edit_message_text(
-                    f"✅ Rated *{email['subject'][:40]}* as `{priority}`\n"
+                    f"✅ Rated *{_esc(email['subject'][:40])}* as `{_esc(priority)}`\n"
                     f"Total ratings this session: *{state['added']}*",
                     parse_mode="Markdown",
                 )
@@ -1079,7 +1174,7 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Cancelled.")
 
     except Exception as ex:
-        await q.edit_message_text(f"❌ {ex}")
+        await q.edit_message_text(f"❌ {_esc(str(ex))}")
     finally:
         db.close()
 

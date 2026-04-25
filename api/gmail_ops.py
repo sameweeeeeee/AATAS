@@ -43,7 +43,7 @@ def _clean(text: str) -> str:
 
 # ── Fetch ──────────────────────────────────────────
 
-def fetch_emails(svc: Resource, max_results: int = 10, query: str = "is:unread") -> list[dict]:
+def fetch_emails(svc: Resource, max_results: int = 10, query: str = "-in:trash -in:spam") -> list[dict]:
     resp = svc.users().messages().list(
         userId="me", maxResults=max_results, q=query
     ).execute()
@@ -60,6 +60,7 @@ def fetch_emails(svc: Resource, max_results: int = 10, query: str = "is:unread")
             "sender":  _header(headers, "From"),
             "date":    _header(headers, "Date"),
             "body":    _clean(_extract_body(payload)),
+            "threadId": msg.get("threadId", ""),
             "labels":  msg.get("labelIds", []),
         })
     return out
@@ -99,6 +100,7 @@ def search_emails(service, query, max_results=10):
             "subject": subject,
             "sender": sender,
             "body": _clean(_extract_body(payload)),
+            "threadId": full.get("threadId", ""),
             "date": _header(headers, "Date")
         })
 

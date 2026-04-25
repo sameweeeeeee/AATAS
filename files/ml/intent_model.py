@@ -26,7 +26,7 @@ DATA_PATH  = "data/intent_training_data.pkl"
 INTENTS = [
     "fetch_inbox", "fetch_priority", "analyse", "search", "archive", "label",
     "trash", "reply", "compose", "create_rule", "delete_rule", "list_rules",
-    "list_history", "none",
+    "list_history", "recall", "none", "web_search", "research",
     "chat_greeting", "chat_how_are_you", "chat_identity", "chat_thanks", "chat_goodbye"
 ]
 
@@ -112,7 +112,7 @@ class IntentModel:
         if len(data) < 5:
             return
         texts, labels = zip(*data)
-        self.label_encoder.fit(INTENTS)
+        self.label_encoder.fit(labels)
         X = self.vectorizer.fit_transform(texts)
         y = self.label_encoder.transform(labels)
         self.classifier.fit(X, y)
@@ -184,7 +184,7 @@ class IntentModel:
 
         # Rebuild fresh components for a clean retrain
         self._make_fresh_components()
-        self.label_encoder.fit(INTENTS)
+        self.label_encoder.fit(labels)
         X = self.vectorizer.fit_transform(texts)
         y = self.label_encoder.transform(labels)
 
