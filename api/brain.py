@@ -62,7 +62,13 @@ _STYLE_COMMANDS = {
     "friendly": ["be friendly", "be more friendly", "speak casually", "be chill", "be nice"],
     "formal":   ["be formal", "speak formally", "professional tone", "be official"],
     "terse":    ["be terse", "be brief", "short answers only", "stay brief"],
-    "jarvis":   ["be jarvis", "jarvis mode", "iron man", "speak like jarvis", "sir"],
+    "jarvis":   ["be jarvis", "jarvis mode", "iron man", "speak like jarvis"],
+    # Revert commands clear any saved style preference and return to auto-detection
+    "normal":   [
+        "revert to normal", "stop jarvis", "exit jarvis", "disable jarvis",
+        "normal mode", "default mode", "reset style", "stop being jarvis",
+        "be normal", "turn off jarvis", "deactivate jarvis",
+    ],
 }
 
 
@@ -76,8 +82,9 @@ def _detect_style(text: str, memories: dict[str, str] = None) -> str:
 
     wc = len(text.split())
     
-    # Jarvis mode detection (heuristic: frequent use of Sir/Jarvis)
-    if "sir" in t or "jarvis" in t:
+    # Jarvis mode detection — word-boundary check prevents false matches
+    # inside words like "surprise", "desire", "I'm not sure it…" etc.
+    if re.search(r"\bsir\b", t) or re.search(r"\bjarvis\b", t):
         return "jarvis"
 
     # Polite words trigger friendly/casual assistant tone
@@ -102,10 +109,22 @@ def _normalize_text(text: str) -> str:
 def _blend_style(db: Session, user_id: int, current: str) -> str:
     """Update the per-user style count in Memory and return the dominant style."""
     mems    = get_memories(db, user_id)
-    
+
     # If user explicitly set a style in this message, save it as their preference
     if current.startswith("FORCE:"):
         pref = current.split(":")[1]
+
+        # "normal" is a special revert token — clear the saved preference entirely
+        # so auto-detection takes over again for future messages.
+        if pref == "normal":
+            if "preferred_style" in mems:
+                from db.database import Memory
+                db.query(Memory).filter_by(
+                    user_id=user_id, key="preferred_style"
+                ).delete()
+                db.commit()
+            return "casual"  # sensible default immediately after revert
+
         upsert_memory(db, user_id, "preferred_style", pref)
         return pref
 
@@ -717,6 +736,22 @@ _RESPONSES: dict[str, dict[str, list[str]]] = {
             "Signing off for now, Sir. Have a productive afternoon.",
         ],
     },
+    "revert_style": {
+        "casual": [
+            "Done! I'm back to my normal self. 😊",
+            "Jarvis mode off — talking normally again!",
+            "Style reset! Back to regular mode.",
+        ],
+        "formal": [
+            "Understood. Reverting to the default communication style.",
+            "Style preference cleared. Standard mode is now active.",
+        ],
+        "terse": ["Normal mode. ✅", "Style reset.", "Done."],
+        "jarvis": [
+            "As you wish, Sir. Reverting to standard operating mode.",
+            "Jarvis Protocol suspended, Sir. Defaulting to casual mode.",
+        ],
+    },
 }
 
 
@@ -828,6 +863,14 @@ class AATASBrain:
         current_style  = _detect_style(text)
         dominant_style = _blend_style(db, user.id, current_style)
         
+    # ── Style-revert short-circuit ────────────────────────────────────
+        # If the user just asked to revert style, confirm and return immediately.
+        if current_style == "FORCE:normal":
+            reply = pick_response("revert_style", dominant_style)
+            save_conv_turn(db, user.id, "user",      text)
+            save_conv_turn(db, user.id, "assistant", reply)
+            return reply
+
         # Smart Passive Learning
         memory_notes = self._smart_memory_guesser(db, user.id, text)
         if cached:

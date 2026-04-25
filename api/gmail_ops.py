@@ -54,14 +54,15 @@ def fetch_emails(svc: Resource, max_results: int = 10, query: str = "-in:trash -
         payload = msg.get("payload", {})
         headers = payload.get("headers", [])
         out.append({
-            "idx":     i + 1,
-            "id":      ref["id"],
-            "subject": _header(headers, "Subject") or "(no subject)",
-            "sender":  _header(headers, "From"),
-            "date":    _header(headers, "Date"),
-            "body":    _clean(_extract_body(payload)),
-            "threadId": msg.get("threadId", ""),
-            "labels":  msg.get("labelIds", []),
+            "idx":        i + 1,
+            "id":         ref["id"],
+            "subject":    _header(headers, "Subject") or "(no subject)",
+            "sender":     _header(headers, "From"),
+            "date":       _header(headers, "Date"),
+            "message_id": _header(headers, "Message-ID"),
+            "body":       _clean(_extract_body(payload)),
+            "threadId":   msg.get("threadId", ""),
+            "labels":     msg.get("labelIds", []),
         })
     return out
 
@@ -70,7 +71,6 @@ def search_emails(service, query, max_results=10):
     # Handle time-based filters like "last 7 days"
     # Gmail API query format for time: "newer_than:7d"
     q = query
-    import re
     m = re.search(r"last (\d+) days", q, re.IGNORECASE)
     if m:
         days = m.group(1)
@@ -150,6 +150,14 @@ def send_reply(svc: Resource, original: dict, reply_body: str):
     msg = email.mime.text.MIMEText(reply_body)
     msg["To"]      = original["sender"]
     msg["Subject"] = "Re: " + original["subject"]
+
+    # Threading headers — without these, Gmail creates a new thread
+    # instead of appending to the existing conversation.
+    message_id = original.get("message_id", "")
+    if message_id:
+        msg["In-Reply-To"] = message_id
+        msg["References"]  = message_id
+
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     svc.users().messages().send(
         userId="me",
@@ -174,47 +182,53 @@ def send_new_email(svc: Resource, to_address: str, subject: str, body: str):
 def _email_matches_rule(email: dict, rule: AutomationRule, brain: Optional[object] = None) -> bool:
     """
     Robust rule matching engine.
-    Supports:
-    - Multiple keywords (OR matching)
-    - Regex patterns (e.g. "regex:.*invoice.*")
-    - Case-insensitive sender contains
+    Matching logic:
+      - If both a sender filter AND keywords are specified, BOTH must match.
+      - If only a sender filter is specified, sender match alone is sufficient.
+      - If only keywords are specified, a keyword match alone is sufficient.
+      - If neither is specified, fall back to semantic matching (brain).
     """
     target = rule.get_target()
     text   = (email["subject"] + " " + email["body"]).lower()
     sender = email["sender"].lower()
 
-    # 1. Sender matching (priority)
+    # 1. Sender matching
     sender_filter = target.get("from", "").strip().lower()
-    if sender_filter and sender_filter not in sender:
+    sender_ok = (not sender_filter) or (sender_filter in sender)
+
+    # Short-circuit: if a sender filter is set but didn't match, reject immediately
+    if sender_filter and not sender_ok:
         return False
 
-    # 2. Keyword/Regex matching
+    # 2. Keyword / regex matching
     keywords = [k.strip() for k in target.get("keywords", []) if k.strip()]
-    matched = False
+    keyword_matched = False
     if keywords:
         for kw in keywords:
             if kw.lower().startswith("regex:"):
                 pattern = kw[6:].strip()
                 try:
                     if re.search(pattern, text, re.IGNORECASE) or re.search(pattern, sender, re.IGNORECASE):
-                        matched = True; break
+                        keyword_matched = True; break
                 except Exception:
-                    pass # ignore invalid regex
+                    pass  # ignore invalid regex patterns
             elif kw.lower() in text:
-                matched = True; break
-    
-    # 3. Semantic matching (fallback if keywords didn't match or were empty)
-    if not matched and brain and hasattr(brain, "check_semantic_match"):
-        # We only do semantic matching if it's a reasonably long rule description
+                keyword_matched = True; break
+
+    # 3. Semantic matching — only used when no explicit keywords were given
+    semantic_matched = False
+    if not keywords and brain and hasattr(brain, "check_semantic_match"):
         if len(rule.rule_text.split()) > 3:
-            matched = brain.check_semantic_match(rule.rule_text, email)
+            semantic_matched = brain.check_semantic_match(rule.rule_text, email)
 
-    # safety: require at least one condition to have been met (keywords, sender, or semantic)
-    # If we have no keywords and no sender filter, semantic is the ONLY way to match.
-    if not matched and not sender_filter:
-        return False
-
-    return matched or (sender_filter != "")
+    # Final decision:
+    # - If keywords were provided, a keyword match is required (in addition to sender if set)
+    # - If no keywords, fall back to sender-only or semantic
+    if keywords:
+        return keyword_matched  # sender already passed above
+    if sender_filter:
+        return True  # sender matched, no keywords required
+    return semantic_matched
 
 def apply_rules(
     svc:     Resource,

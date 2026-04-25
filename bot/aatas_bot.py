@@ -14,6 +14,7 @@ Features:
 import asyncio
 import logging
 import os
+import re 
 import sys
 from typing import Optional
 
@@ -77,6 +78,10 @@ Type */decline* to exit"""
 # ── In-memory caches ────────────────────────────────────────
 # Email cache per user
 _cache: dict[int, list[dict]] = {}
+
+# Inbox pagination state per user {telegram_id: page_number}
+_inbox_page: dict[int, int] = {}
+INBOX_PAGE_SIZE = 10  # emails displayed per page
 
 # Trainer mode state per user
 # {telegram_id: {"active": bool, "mode": "intent"|"priority",
@@ -159,6 +164,35 @@ def _esc(text) -> str:
     if text is None: return ""
     return escape_markdown(str(text), version=1)
 
+def _inbox_page_keyboard(tg_id: int, total: int) -> InlineKeyboardMarkup:
+    """Build Previous / Next navigation buttons for inbox pagination."""
+    page     = _inbox_page.get(tg_id, 0)
+    max_page = max(0, (total - 1) // INBOX_PAGE_SIZE)
+    buttons  = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data="inbox_prev"))
+    if page < max_page:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data="inbox_next"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+def _render_inbox_page(tg_id: int, emails: list[dict], title: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Return (message_text, reply_markup) for the current inbox page."""
+    page   = _inbox_page.get(tg_id, 0)
+    start  = page * INBOX_PAGE_SIZE
+    slice_ = emails[start: start + INBOX_PAGE_SIZE]
+
+    total_pages = max(1, -(-len(emails) // INBOX_PAGE_SIZE))  # ceiling division
+    header = f"📬 *{_esc(title)} — Page {page + 1}/{total_pages} ({len(emails)} total):*\n"
+    lines  = [header]
+    for e in slice_:
+        lines.append(
+            f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n"
+            f"   👤 {_esc(e['sender'][:35])}\n"
+        )
+    lines.append("\n_Say \"analyse 3\" or \"archive 2\" to take action._")
+    markup = _inbox_page_keyboard(tg_id, len(emails))
+    return "\n".join(lines), markup
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -288,18 +322,19 @@ async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Fetching inbox...")
     try:
         svc    = get_gmail_service(user)
-        emails = fetch_emails(svc, max_results=20, query="is:unread")
-        _cache[user.telegram_id] = emails  # force refresh cache
+        emails = fetch_emails(svc, max_results=30, query="is:unread")
+        _cache[user.telegram_id] = emails
+        _inbox_page[user.telegram_id] = 0  # reset to first page on fresh fetch
 
         if not emails:
             await msg.edit_text("📭 No unread emails!")
             db.close(); return
 
-        lines = ["📬 *Your unread inbox:*\n"]
-        for e in emails:
-            lines.append(f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n   👤 {_esc(e['sender'][:35])}\n")
-        lines.append("\n_Say \"analyse 3\" or \"archive 2\" to take action._")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        text, markup = _render_inbox_page(user.telegram_id, emails, "Unread Inbox")
+        kwargs = {"parse_mode": "Markdown"}
+        if markup:
+            kwargs["reply_markup"] = markup
+        await msg.edit_text(text, **kwargs)
 
     except Exception as ex:
         await msg.edit_text(f"❌ {ex}")
@@ -331,7 +366,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         svc = get_gmail_service(user)
         # Check for date filters in keywords
         query = keyword
-        emails = search_emails(svc, query, max_results=20)
+        emails = search_emails(svc, query,30)
         
         if not emails:
             await msg.edit_text("No results found.")
@@ -370,6 +405,22 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db.close()
     await update.message.reply_text("🔊 *Automations unmuted.* I'll notify you of automated actions.", parse_mode="Markdown")
 
+async def cmd_revert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Clear any saved style preference so auto-detection resumes."""
+    db, user = _get_user(update)
+    try:
+        from db.database import Memory
+        db.query(Memory).filter_by(user_id=user.id, key="preferred_style").delete()
+        db.commit()
+        await update.message.reply_text(
+            "✅ *Style reset.* I'm back to normal mode — no more Jarvis or forced styles.\n"
+            "_Tip: You can always say \"Jarvis mode\" to reactivate it._",
+            parse_mode="Markdown",
+        )
+    except Exception as ex:
+        await update.message.reply_text(f"❌ Could not reset style: {ex}")
+    finally:
+        db.close()
 
 # ── Auto-Refresh Job ──────────────────────────────────────────
 
@@ -383,7 +434,7 @@ async def job_auto_check(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             svc = get_gmail_service(user)
             # Fetch unread emails
-            emails = fetch_emails(svc, max_results=20, query="is:unread")
+            emails = fetch_emails(svc, max_results=30, query="is:unread")
             if not emails:
                 continue
                 
@@ -431,7 +482,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"⏳ Checking inbox against {len(rules)} rules...")
     try:
         svc     = get_gmail_service(user)
-        emails  = fetch_emails(svc, max_results=50, query="is:unread")
+        emails  = fetch_emails(svc, max_results=30, query="is:unread")
         applied = apply_rules(svc, db, user.id, emails, rules, brain)
 
         if not applied:
@@ -777,30 +828,29 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     if action == "fetch_inbox":
         brain.record_passive_example(original_text, action)
         if svc:
-            # If user explicitly said "unread", use that filter.
-            # Otherwise, use the new permissive default from gmail_ops.
             query = "-in:trash -in:spam"
             if "unread" in original_text.lower():
                 query = "is:unread"
-            
-            emails = fetch_emails(svc, max_results=20, query=query)
+
+            emails = fetch_emails(svc, max_results=30, query=query)
             _cache[tg_id] = emails
+            _inbox_page[tg_id] = 0  # reset to first page
             if emails:
                 title = "Unread Inbox" if "unread" in query else "Latest Emails"
-                lines = [f"📬 *{title} (last {len(emails)}):*\n"]
-                for e in emails:
-                    lines.append(f"`{e['idx']}.` *{_esc(e['subject'][:45])}*\n   👤 {_esc(e['sender'][:35])}\n")
-                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+                text, markup = _render_inbox_page(tg_id, emails, title)
+                kwargs = {"parse_mode": "Markdown"}
+                if markup:
+                    kwargs["reply_markup"] = markup
+                await update.message.reply_text(text, **kwargs)
 
     elif action == "search":
         brain.record_passive_example(original_text, action)
         if svc:
             query = original_text
             # Remove "search for" or "find" from query
-            import re
             query = re.sub(r"^(?:search(?:\s+for)?|find(?:\s+emails?\s+about)?)\s+", "", query, flags=re.IGNORECASE).strip()
             
-            emails = search_emails(svc, query, max_results=20)
+            emails = search_emails(svc, query,30)
             
             if not query or query == "?":
                 await update.message.reply_text("What would you like me to search for, Sir? (e.g. _'search for invoice'_)")
@@ -822,7 +872,6 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
 
     elif action == "web_search":
         brain.record_passive_example(original_text, action)
-        import re
         query = original_text
         query = re.sub(r"^(?:search(?:\s+for)?|look\s+up|find(?:\s+info(?:rmation)?\s+on)?)\s+", "", query, flags=re.IGNORECASE).strip()
         query = query.rstrip("?")
@@ -849,7 +898,6 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
 
     elif action == "research":
         brain.record_passive_example(original_text, action)
-        import re
         m = re.search(r"research\s+(\d+)", original_text.lower())
         url = ""
         title = ""
@@ -1082,6 +1130,23 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     db, user = _get_user(update)
 
+# ── Inbox pagination ──────────────────────────────────
+    if data in ("inbox_prev", "inbox_next"):
+        emails = _cache.get(tg_id, [])
+        if not emails:
+            await q.edit_message_text("No inbox loaded. Say 'show my inbox' first.")
+            db.close(); return
+        page     = _inbox_page.get(tg_id, 0)
+        max_page = max(0, (len(emails) - 1) // INBOX_PAGE_SIZE)
+        new_page = max(0, page - 1) if data == "inbox_prev" else min(max_page, page + 1)
+        _inbox_page[tg_id] = new_page
+        text, markup = _render_inbox_page(tg_id, emails, "Inbox")
+        kwargs = {"parse_mode": "Markdown"}
+        if markup:
+            kwargs["reply_markup"] = markup
+        await q.edit_message_text(text, **kwargs)
+        db.close(); return
+
     try:
         await _typing(update)
         # ── Trainer intent labelling ──────────────────────────
@@ -1197,6 +1262,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("history",  cmd_history))
     app.add_handler(CommandHandler("mute",     cmd_mute))
     app.add_handler(CommandHandler("unmute",   cmd_unmute))
+    app.add_handler(CommandHandler("revert",   cmd_revert))
+    app.add_handler(CommandHandler("normal",   cmd_revert))  # alias
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("train",    cmd_train))
     app.add_handler(CommandHandler("done",     cmd_done))
@@ -1227,6 +1294,7 @@ async def _set_commands(app: Application):
         BotCommand("stats",    "View AI model stats"),
         BotCommand("train",    "Enter trainer mode (secret code required)"),
         BotCommand("help",     "Help"),
+        BotCommand("revert",   "Exit Jarvis mode, return to normal style"),
     ])
 
 
