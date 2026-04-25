@@ -114,6 +114,18 @@ def send_reply(svc: Resource, original: dict, reply_body: str):
         body={"raw": raw, "threadId": original.get("threadId", "")}
     ).execute()
 
+def send_new_email(svc: Resource, to_address: str, subject: str, body: str):
+    import email.mime.text
+    msg = email.mime.text.MIMEText(body)
+    msg["To"]      = to_address
+    msg["Subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    svc.users().messages().send(
+        userId="me",
+        body={"raw": raw}
+    ).execute()
+
+
 
 # ── Rule engine ────────────────────────────────────
 
@@ -122,19 +134,18 @@ def _email_matches_rule(email: dict, rule: AutomationRule) -> bool:
     target = rule.get_target()
     text   = (email["subject"] + " " + email["body"] + " " + email["sender"]).lower()
 
-    # keyword matching
-    keywords = target.get("keywords", [])
+    # keyword matching — any keyword must appear anywhere in subject/body/sender
+    keywords = [k for k in target.get("keywords", []) if k.strip()]
     if keywords and not any(kw.lower() in text for kw in keywords):
         return False
 
     # sender matching
-    sender_filter = target.get("from", "")
+    sender_filter = target.get("from", "").strip()
     if sender_filter and sender_filter.lower() not in email["sender"].lower():
         return False
 
-    # label matching (Gmail system label)
-    label_filter = target.get("has_label", "")
-    if label_filter and label_filter.upper() not in email["labels"]:
+    # safety: require at least one condition to be set (prevents matching ALL emails)
+    if not keywords and not sender_filter:
         return False
 
     return True

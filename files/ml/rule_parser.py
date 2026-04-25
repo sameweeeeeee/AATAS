@@ -6,15 +6,15 @@ Pure Python regex + heuristics. No external API needed.
 
 import re
 
-# ── Action detection ─────────────────────────────────────────
+# ── Action detection ───────────────────────────────────────────────────────
 
 _ACTION_PATTERNS = [
-    ("trash",     [r"\btrash\b", r"\bdelete\b", r"\bremove\b", r"\bget rid of\b"]),
-    ("label",     [r"\blabel\b", r"\btag\b", r"\bmark as\b", r"\bcategoris[e]?\b",
-                   r"\bcategoriz[e]?\b", r"\bflag as\b", r"\bput under\b"]),
-    ("mark_read", [r"\bmark.{0,10}read\b", r"\bmark read\b"]),
-    ("archive",   [r"\barchive\b", r"\bmove to archive\b", r"\bput in archive\b",
-                   r"\bremove from inbox\b", r"\bfile away\b"]),
+    ("trash",     [r"\btrash\b", r"\bdelete\b", r"\bget rid of\b"]),
+    ("label",     [r"\blabel\b", r"\btag\b", r"\bmark\s+as\b", r"\bcategoris[e]?\b",
+                   r"\bcategoriz[e]?\b", r"\bflag\s+as\b", r"\bflag\b", r"\bput under\b"]),
+    ("mark_read", [r"\bmark\s+read\b", r"\bmark.{1,10}as\s+read\b"]),
+    ("archive",   [r"\barchive\b", r"\bmove to archive\b", r"\bfile away\b",
+                   r"\bremove from inbox\b"]),
 ]
 
 _STOP_WORDS = {
@@ -25,77 +25,96 @@ _STOP_WORDS = {
     "and", "or", "but", "if", "in", "on", "at", "to", "for", "of", "with",
     "by", "about", "from", "into", "through", "during", "after", "before",
     "emails", "email", "messages", "message", "mail", "automatically",
-    "auto", "always", "whenever", "every", "time", "get",
+    "auto", "always", "whenever", "every", "time", "get", "them",
 }
 
-# Words to strip when extracting keywords
-_ACTION_WORDS = r"""
-    \b(?:archive|label|trash|delete|remove|mark|tag|categorise|categorize|
-    flag|emails?|messages?|anything|everything|all|about|containing|with|that|
-    mention|mentions|related|regarding|from|sent\sby|labell?ed?|as|them|
-    automatically|auto|always|whenever|every(?:time)?|put|in|archive|
-    move|to|file|away|get|rid|of)\b
-"""
+# Verbs/function-words to strip when pulling out content keywords
+_STRIP_RE = re.compile(
+    r"\b(?:archive|label|tag|flag|trash|delete|remove|mark|categorise|categorize|"
+    r"put|move|file|get|rid|away|automatically|auto|always|whenever|everytime?|"
+    r"emails?|messages?|mail|anything|everything|all|about|containing|with|that|"
+    r"mention|mentions?|related|regarding|sent\s+by|labell?ed?|them|read)\b",
+    re.IGNORECASE,
+)
 
 
 def _detect_action(text: str) -> str:
     t = text.lower()
+    # mark_read must be checked before generic "mark as" label detection
     for action, patterns in _ACTION_PATTERNS:
         for p in patterns:
             if re.search(p, t):
                 return action
-    return "archive"  # sensible default
+    return "archive"
 
 
 def _extract_keywords(text: str) -> list[str]:
     """Extract meaningful content words from a rule instruction."""
-    # First: pull anything in quotes
+    # Pull anything in quotes first
     quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
     if quoted:
         return [q[0] or q[1] for q in quoted][:5]
 
-    # Remove action vocabulary
-    clean = re.sub(_ACTION_WORDS, " ", text, flags=re.IGNORECASE | re.VERBOSE)
+    # Remove the label phrase (everything from 'as <word>' at end)
+    clean = re.sub(r'\bas\s+\S[\w\s]{0,30}$', "", text, flags=re.IGNORECASE)
+    # Remove action verbs and function words
+    clean = _STRIP_RE.sub(" ", clean)
+    # Remove email addresses (handled separately by sender extractor)
+    clean = re.sub(r'\b[\w.+\-]+@[\w\-]+\.\w+\b', " ", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    # Extract meaningful words
-    words = re.findall(r"\b[a-z][a-z]{2,}\b", clean.lower())
+    words    = re.findall(r"\b[a-z][a-z]{2,}\b", clean.lower())
     keywords = [w for w in words if w not in _STOP_WORDS]
 
-    # Also try bigrams
-    bigrams = []
-    for i in range(len(keywords) - 1):
-        bigrams.append(f"{keywords[i]} {keywords[i+1]}")
-
-    # Prefer bigrams when available, else single words
-    result = list(dict.fromkeys(bigrams + keywords))
+    bigrams = [f"{keywords[i]} {keywords[i+1]}" for i in range(len(keywords) - 1)]
+    result  = list(dict.fromkeys(bigrams + keywords))
     return result[:5]
 
 
 def _extract_sender(text: str) -> str:
-    """Extract an email or name-based sender filter."""
-    # Full email address
+    """Extract an email address or name after 'from'."""
+    # Full email address anywhere in the text
     m = re.search(r"\b[\w.+\-]+@[\w\-]+\.\w+\b", text)
     if m:
         return m.group(0)
-    # "from <name>" pattern
-    m = re.search(r"\bfrom\s+([A-Za-z][\w ]{1,25}?)(?:\s+(?:as|with|label|tag|to|archive|trash)|$)", text, re.IGNORECASE)
+    # "from <name>" pattern — stop before action keywords
+    m = re.search(
+        r"\bfrom\s+([A-Za-z][\w ]{1,30}?)(?=\s+(?:as|label|tag|archive|trash|delete|mark|and|$)|\s*$)",
+        text, re.IGNORECASE,
+    )
     if m:
         name = m.group(1).strip()
-        if name.lower() not in _STOP_WORDS and len(name) > 2:
+        if name.lower() not in _STOP_WORDS and len(name) > 1:
             return name
     return ""
 
 
 def _extract_label_name(text: str, action: str) -> str:
-    """Extract label name for label actions."""
-    if action != "label":
+    """
+    Extract the label name for label/tag/flag actions.
+    Always looks for what comes AFTER the word 'as'.
+
+    Examples:
+      'label emails from bob as work'          -> 'work'
+      'label anything about invoice as bills'  -> 'bills'
+      'flag emails about meetings as important'-> 'important'
+      'mark as urgent'                         -> 'urgent'
+      'tag emails from hr as projects'         -> 'projects'
+    """
+    if action not in ("label",):
         return ""
-    m = re.search(
-        r'(?:label|tag|mark|flag|categoris[e]?|categoriz[e]?)\s+(?:as|:)?\s*["\']?([a-z][a-z0-9_\- ]{0,25})["\']?',
-        text, re.IGNORECASE,
-    )
-    return m.group(1).strip() if m else "labelled"
+
+    # The label name is whatever comes after the last 'as' in the sentence
+    m = re.search(r'\bas\s+([a-z][a-z0-9_\-]{0,30})\s*$', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().lower()
+
+    # Fallback: 'mark as <label>' where 'as' might be mid-sentence
+    m = re.search(r'\bmark\s+as\s+([a-z][a-z0-9_\-]{0,30})\b', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().lower()
+
+    return "labelled"
 
 
 def parse_rule(text: str) -> dict:

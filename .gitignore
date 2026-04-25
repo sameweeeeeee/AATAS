@@ -16,3 +16,11 @@ logs/
 # virtual env (if you ever use one)
 venv/
 .env/
+
+.env
+credentials.json
+data/
+*.db
+*.wal
+*.shm
+*.pkl

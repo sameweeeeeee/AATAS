@@ -33,7 +33,7 @@ from api.brain import AATASBrain
 from api.gmail_auth import get_auth_url, get_gmail_service
 from api.gmail_ops import (
     archive_email, apply_label, apply_rules, fetch_emails,
-    mark_read, send_reply, trash_email,
+    mark_read, send_reply, trash_email, send_new_email,
 )
 from db.database import (
     ActionLog, AutomationRule, SessionLocal,
@@ -81,6 +81,9 @@ _cache: dict[int, list[dict]] = {}
 #                "pending": str|None, "added": int}}
 _trainer: dict[int, dict] = {}
 
+# Compose drafts per user
+_drafts: dict[int, dict] = {}
+
 PRIORITY_ICON = {"urgent": "🔴", "important": "🟡", "normal": "🟢", "low": "⚪"}
 
 # Intent labels for trainer buttons
@@ -92,6 +95,7 @@ _INTENT_LABELS = [
     ("🏷️ Label",          "label"),
     ("🗑️ Trash",          "trash"),
     ("✍️ Reply",          "reply"),
+    ("📝 Compose",        "compose"),
     ("⚙️ Create Rule",   "create_rule"),
     ("📋 List Rules",     "list_rules"),
     ("📜 History",        "list_history"),
@@ -620,18 +624,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{e['idx']}. {e['subject']} | {e['sender']}" for e in cached[:10]
             )
 
-        reply_text, intent = brain.chat(
+        reply_texts, intent_dicts = brain.chat(
             db, user, text,
             context_hint=ctx_hint,
+            cached_emails=cached,
             show_disclaimer=show_disclaimer,
         )
 
-        if intent:
-            await _execute_intent(update, ctx, db, user, svc, intent, reply_text, text)
+        if not intent_dicts:
+            for reply_text in reply_texts:
+                await update.message.reply_text(
+                    reply_text or "I didn't quite catch that.", parse_mode="Markdown"
+                )
         else:
-            await update.message.reply_text(
-                reply_text or "I didn't quite catch that.", parse_mode="Markdown"
-            )
+            for intent_dict, reply_text in zip(intent_dicts, reply_texts):
+                await _execute_intent(update, ctx, db, user, svc, intent_dict, reply_text, text)
 
     except Exception as ex:
         log.exception("handle_message error")
@@ -654,10 +661,12 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     if action == "fetch_inbox":
         brain.record_passive_example(original_text, action)
         if svc:
-            emails = fetch_emails(svc, max_results=10)
+            limit = intent.get("email_idx") or 10
+            limit = min(limit, 50)  # Max out at 50 to prevent huge requests
+            emails = fetch_emails(svc, max_results=limit)
             _cache[tg_id] = emails
             if emails:
-                lines = ["📬 *Inbox:*\n"]
+                lines = [f"📬 *Inbox (last {len(emails)}):*\n"]
                 for e in emails:
                     lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}\n")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -665,7 +674,9 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     elif action == "fetch_priority":
         brain.record_passive_example(original_text, action)
         if svc:
-            emails = fetch_emails(svc, max_results=15)
+            limit = intent.get("email_idx") or 15
+            limit = min(limit, 50)
+            emails = fetch_emails(svc, max_results=limit)
             _cache[tg_id] = emails
             scored = []
             for e in emails:
@@ -673,7 +684,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
                 scored.append((e, priority, conf))
             order = {"urgent": 0, "important": 1, "normal": 2, "low": 3}
             scored.sort(key=lambda x: order.get(x[1], 9))
-            lines = ["📊 *Inbox by priority:*\n"]
+            lines = [f"📊 *Inbox by priority (last {len(emails)}):*\n"]
             for e, p, c in scored:
                 icon = PRIORITY_ICON.get(p, "•")
                 lines.append(f"`{e['idx']}.` {icon} `{p}` — {e['subject'][:40]}")
@@ -746,6 +757,41 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         ]])
         await update.message.reply_text(
             f"💬 *Draft reply ({tone}):*\n\n_{draft}_",
+            parse_mode="Markdown", reply_markup=kbd,
+        )
+
+    elif action == "compose":
+        brain.record_passive_example(original_text, action)
+        params = intent.get("action_params", {})
+        to_address = params.get("to")
+        message = params.get("message")
+        subject = params.get("subject")
+        tone = params.get("tone", "professional")
+        
+        # Pronoun resolution: resolve "him/her" if we have a pending draft
+        if to_address and to_address.lower() in ["him", "her", "them", "it"] and tg_id in _drafts:
+            to_address = _drafts[tg_id]["to"]
+            if not subject:
+                subject = _drafts[tg_id].get("subject")
+
+        if not to_address:
+            await update.message.reply_text("I couldn't figure out who to send this to. Try specifying an email address or name.")
+            return
+            
+        final_subject, final_body = brain.draft_new_email(to_address, subject, message, tone)
+        
+        _drafts[tg_id] = {"to": to_address, "subject": final_subject, "body": final_body}
+        
+        kbd = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 Send Email", callback_data="sendnew"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        ]])
+        
+        await update.message.reply_text(
+            f"📝 *Draft new email ({tone}):*\n\n"
+            f"*To:* {to_address}\n"
+            f"*Subject:* {final_subject}\n"
+            f"*Message:*\n_{final_body}_\n",
             parse_mode="Markdown", reply_markup=kbd,
         )
 
@@ -893,6 +939,16 @@ async def button_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 send_reply(svc, e, draft)
                 log_action(db, user.id, "reply", msg_id, e["subject"])
                 await q.edit_message_text("📤 Reply sent!")
+
+        elif data == "sendnew":
+            draft = _drafts.get(tg_id)
+            if draft:
+                send_new_email(svc, draft["to"], draft["subject"], draft["body"])
+                log_action(db, user.id, "compose", "", draft["subject"])
+                await q.edit_message_text("📤 Email sent!")
+                _drafts.pop(tg_id, None)
+            else:
+                await q.edit_message_text("⚠️ Draft expired or not found.")
 
         elif data == "cancel":
             await q.edit_message_text("Cancelled.")

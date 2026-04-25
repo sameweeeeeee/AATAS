@@ -25,8 +25,9 @@ DATA_PATH  = "data/intent_training_data.pkl"
 # All supported intents
 INTENTS = [
     "fetch_inbox", "fetch_priority", "analyse", "archive", "label",
-    "trash", "reply", "create_rule", "delete_rule", "list_rules",
+    "trash", "reply", "compose", "create_rule", "delete_rule", "list_rules",
     "list_history", "none",
+    "chat_greeting", "chat_how_are_you", "chat_identity", "chat_thanks", "chat_goodbye"
 ]
 
 
@@ -121,7 +122,7 @@ class IntentModel:
 
     def predict(self, text: str) -> tuple[str, float]:
         """
-        Predict intent from text.
+        Predict single intent from text (legacy).
         Returns (intent_label, confidence_0_to_1).
         """
         if not self.is_trained:
@@ -132,6 +133,31 @@ class IntentModel:
         intent     = self.label_encoder.inverse_transform([idx])[0]
         confidence = float(probs[idx])
         return intent, confidence
+
+    def predict_multi(self, text: str, threshold: float = 0.25) -> list[tuple[str, float]]:
+        """
+        Predict multiple intents from text.
+        Returns a list of (intent_label, confidence) for all probabilities above threshold.
+        """
+        if not self.is_trained:
+            return [("none", 0.0)]
+        X     = self.vectorizer.transform([text.lower()])
+        probs = self.classifier.predict_proba(X)[0]
+        
+        results = []
+        for idx, prob in enumerate(probs):
+            if prob >= threshold:
+                intent = self.label_encoder.inverse_transform([idx])[0]
+                results.append((intent, float(prob)))
+                
+        # Sort by confidence descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        
+        if not results:
+            # If nothing crossed threshold, return the max one so fallback kicks in
+            return [self.predict(text)]
+            
+        return results
 
     def add_example(self, text: str, intent: str):
         """
