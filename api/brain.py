@@ -82,10 +82,10 @@ def _detect_style(text: str, memories: dict[str, str] = None) -> str:
 
     wc = len(text.split())
     
-    # Jarvis mode detection — word-boundary check prevents false matches
-    # inside words like "surprise", "desire", "I'm not sure it…" etc.
-    if re.search(r"\bsir\b", t) or re.search(r"\bjarvis\b", t):
-        return "jarvis"
+    # Jarvis is only activated via explicit commands ("be jarvis", "jarvis mode")
+    # handled above by _STYLE_COMMANDS → FORCE: path.
+    # Auto-detecting on "sir"/"jarvis" in any message caused it to permanently
+    # stick in the DB via _blend_style even during normal searches.
 
     # Polite words trigger friendly/casual assistant tone
     if any(w in t for w in ["please", "thanks", "thank you", "could you", "would you", "hey", "hi", "hello"]):
@@ -920,7 +920,14 @@ class AATASBrain:
                 # Only add web_search if we don't already have a strong chat intent
                 has_chat_intent = any(p[0].startswith("chat_") and p[1] >= 0.4 for p in predictions)
                 if not has_chat_intent:
-                    web_keywords = ["search for", "look up", "google", "find information on", "who is", "what is"]
+                    web_keywords = [
+                        "search for", "search the web", "search the internet",
+                        "help me search", "look up", "google",
+                        "find information on", "find me", "find out",
+                        "who is", "what is", "tell me about",
+                        "today's news", "latest news", "news about",
+                        "what happened", "current events",
+                    ]
                     internal_keywords = ["inbox", "rule", "email", "archive", "trash", "label", "reply", "compose", "your name", "who are you"]
                     if any(k in s_text.lower() for k in web_keywords) and not any(k in s_text.lower() for k in internal_keywords):
                         predictions.append(("web_search", 0.6))

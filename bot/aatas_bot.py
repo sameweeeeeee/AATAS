@@ -873,18 +873,42 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
     elif action == "web_search":
         brain.record_passive_example(original_text, action)
         query = original_text
-        query = re.sub(r"^(?:search(?:\s+for)?|look\s+up|find(?:\s+info(?:rmation)?\s+on)?)\s+", "", query, flags=re.IGNORECASE).strip()
-        query = query.rstrip("?")
-        
+
+        # Strip leading filler: "help me", "can you", "please", etc.
+        query = re.sub(
+            r"^(?:(?:help\s+me|can\s+you|please|could\s+you|would\s+you)\s+)?",
+            "", query, flags=re.IGNORECASE
+        ).strip()
+
+        # Strip the search verb: "search for", "look up", "google", "tell me about", etc.
+        query = re.sub(
+            r"^(?:search(?:\s+(?:for|up|the\s+(?:web|internet)\s+for))?|"
+            r"look\s+up|find(?:\s+(?:info(?:rmation)?\s+(?:on|about)|me))?|"
+            r"google|tell\s+me\s+about|what\s+is|who\s+is)\s+",
+            "", query, flags=re.IGNORECASE
+        ).strip()
+
+        # Strip trailing instructions like "and tell me about it", "and explain",
+        # "& summarise", "n tell me abt it", "and give me info", etc.
+        query = re.sub(
+            r"\s*(?:and|&|n)\s+"
+            r"(?:tell\s+me|explain|summarize|summarise|describe|give\s+me|"
+            r"tell\s+me\s+abt|tell\s+me\s+about|abt|info(?:rm\s+me)?|"
+            r"let\s+me\s+know|show\s+me).*$",
+            "", query, flags=re.IGNORECASE
+        ).strip()
+
+        query = query.rstrip("?").strip()
+
         if not query:
-            await update.message.reply_text("What would you like me to search for, Sir?")
+            await update.message.reply_text("What would you like me to search for?")
             return
 
         msg = await update.message.reply_text(f"🌐 Searching for '{query}'...")
         results = search_web(query, max_results=5)
         
         if not results:
-            await msg.edit_text("I'm sorry, Sir. My search returned no relevant results.")
+            await msg.edit_text(f"⚠️ No results found for *'{query}'*. Try rephrasing your search.", parse_mode="Markdown")
         else:
             lines = [f"🌐 *Web Search Results for '{query}':*\n"]
             cache_data = []
