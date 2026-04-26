@@ -28,9 +28,16 @@ def get_priority_model() -> PriorityModel:
 
 
 def retrain_all() -> dict:
-    """Retrain all models and return a combined stats report."""
-    intent_stats   = get_intent_model().retrain()
+    intent_model   = get_intent_model()
+    intent_stats   = intent_model.retrain()
     priority_stats = get_priority_model().retrain()
+
+    # Retrain neural fallback with the updated intent model
+    from files.ml.neural_fallback import NeuralFallback
+    nf = NeuralFallback()
+    nf.load_or_init(intent_model)
+    nf.train(intent_model.training_data)
+
     return {
         "intent":   intent_stats,
         "priority": priority_stats,

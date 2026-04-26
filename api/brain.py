@@ -27,6 +27,7 @@ from db.database import (
     search_knowledge,
 )
 from files.ml.trainer import get_intent_model, get_priority_model
+from files.ml.neural_fallback import NeuralFallback
 from files.ml.rule_parser import parse_rule
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -63,10 +64,10 @@ _FORMAL = re.compile(
 
 
 _STYLE_COMMANDS = {
-    "friendly": ["be friendly", "be more friendly", "speak casually", "be chill", "be nice"],
-    "formal":   ["be formal", "speak formally", "professional tone", "be official"],
+    "friendly": ["be friendly", "be more friendly", "speak casually", "be chill", "be nice", "casual mode", "casual"],
+    "formal":   ["be formal", "speak formally", "professional tone", "be official", "formal mode", "formal"],
     "terse":    ["be terse", "be brief", "short answers only", "stay brief"],
-    "jarvis":   ["be jarvis", "jarvis mode", "iron man", "speak like jarvis"],
+    "jarvis":   ["be jarvis", "jarvis mode", "iron man", "speak like jarvis", "jarvis", "activate jarvis"],
     # Revert commands clear any saved style preference and return to auto-detection
     "normal":   [
         "revert to normal", "stop jarvis", "exit jarvis", "disable jarvis",
@@ -897,6 +898,10 @@ class AATASBrain:
         self.intent_model   = get_intent_model()
         self.priority_model = get_priority_model()
         self.priority_model.load_or_init()
+        self.neural_fallback = NeuralFallback()
+        self.neural_fallback.load_or_init(self.intent_model)
+        if not self.neural_fallback.is_trained:
+            self.neural_fallback.train(self.intent_model.training_data)
         self.guesser        = MemoryGuesser()
 
     def _smart_memory_guesser(self, db: Session, user_id: int, text: str) -> list[str]:
@@ -936,19 +941,74 @@ class AATASBrain:
         - Returns ([reply_texts], [intent_dicts])
         """
         text   = user_message.strip()
+        # Strip leading filler words that confuse intent detection
+        # e.g. "anyways who am i" → "who am i", "so like what is photosynthesis" → "what is photosynthesis"
+        import re as _re_filler
+        text = _re_filler.sub(
+            r"^(?:anyways?|so\s+like|so|btw|by\s+the\s+way|like|okay\s+so|ok\s+so|right\s+so|also|also\s+like)[,\s]+",
+            "", text, flags=_re_filler.IGNORECASE
+        ).strip() or text
         cached = cached_emails or []
+
+        # Normalise common typos and shorthand before intent detection
+        _TYPO_MAP = [
+            (r"todays",     "today's"),
+            (r"tomorrows",  "tomorrow's"),
+            (r"weathers?",  "weather"),
+            (r"wats",       "what is"),
+            (r"wut",        "what"),
+            (r"u",          "you"),
+            (r"ur",         "your"),
+            (r"r",          "are"),
+            (r"pls",        "please"),
+            (r"plz",        "please"),
+            (r"thx",        "thanks"),
+            (r"tnx",        "thanks"),
+            (r"gonna",      "going to"),
+            (r"wanna",      "want to"),
+            (r"gotta",      "got to"),
+            (r"dunno",      "don't know"),
+            (r"lemme",      "let me"),
+            (r"gimme",      "give me"),
+            (r"cya",        "goodbye"),
+            (r"idk",        "i don't know"),
+            (r"ngl",        "not gonna lie"),
+            (r"tbh",        "to be honest"),
+        ]
+        import re as _re_typo
+        _text_normalised = text
+        for pattern, replacement in _TYPO_MAP:
+            _text_normalised = _re_typo.sub(pattern, replacement, _text_normalised, flags=_re_typo.IGNORECASE)
+        if _text_normalised != text:
+            text = _text_normalised
 
         conv_history   = get_conv_history(db, user.id, last_n=10)
         current_style  = _detect_style(text)
         dominant_style = _blend_style(db, user.id, current_style)
         
-    # ── Style-revert short-circuit ────────────────────────────────────
+        # ── Style-revert short-circuit ────────────────────────────────────
         # If the user just asked to revert style, confirm and return immediately.
         if current_style == "FORCE:normal":
             reply = pick_response("revert_style", dominant_style)
             save_conv_turn(db, user.id, "user",      text)
             save_conv_turn(db, user.id, "assistant", reply)
-            return reply
+            return [reply], []
+
+        # ── Other explicit style-switch short-circuit ─────────────────────
+        # "be formal", "jarvis mode", "speak casually" etc. — just confirm the switch.
+        if current_style.startswith("FORCE:"):
+            style_name = dominant_style  # _blend_style already saved the new pref
+            _STYLE_CONFIRM = {
+                "jarvis":   "Jarvis Protocol activated, Sir. How may I assist you?",
+                "formal":   "Understood. Switching to formal mode.",
+                "friendly": "Sure! I'll keep things friendly and casual. 😊",
+                "terse":    "Got it. Short answers from here on.",
+                "casual":   "No problem! Keeping it casual. 😊",
+            }
+            reply = _STYLE_CONFIRM.get(style_name, f"Style set to *{style_name}*. ✅")
+            save_conv_turn(db, user.id, "user",      text)
+            save_conv_turn(db, user.id, "assistant", reply)
+            return [reply], []
 
         # Smart Passive Learning
         memory_notes = self._smart_memory_guesser(db, user.id, text)
@@ -956,8 +1016,40 @@ class AATASBrain:
             _extract_email_entities(db, user.id, cached)
 
         # 1. Split text into sentences for better recognition
-        sentences = [s.strip() for s in _SENT_SPLIT.split(text) if len(s.strip()) > 2]
-        if not sentences: sentences = [text]
+        # Also split on conjunction patterns that signal a topic shift:
+        # "hello and tell me about X", "hi, what's the weather", "hey search for X"
+        _CONJ_SPLIT = re.compile(
+            r"(?<=[a-z])\s+(?:and\s+(?:also\s+)?|also\s+|then\s+|but\s+(?:also\s+)?)"
+            r"(?=(?:search|find|tell|show|get|check|what|who|how|when|where|why|look|help|can you|could you))",
+            re.IGNORECASE,
+        )
+        # First split on punctuation, then on conjunctions within each piece
+        _raw_sentences = _SENT_SPLIT.split(text)
+        sentences = []
+        for piece in _raw_sentences:
+            piece = piece.strip()
+            if not piece:
+                continue
+            sub = [s.strip() for s in _CONJ_SPLIT.split(piece) if s.strip()]
+            sentences.extend(sub if sub else [piece])
+        if not sentences:
+            sentences = [text]
+
+        # Split greeting prefix from a following request in the same sentence
+        # e.g. "hello tell me about weather" → ["hello", "tell me about weather"]
+        _GREETING_PREFIX = re.compile(
+            r"^(hi+|hey+|hello+|hiya|yo|sup|greetings?)[,!]?\s+(?=\w)",
+            re.IGNORECASE,
+        )
+        expanded = []
+        for s in sentences:
+            m = _GREETING_PREFIX.match(s)
+            if m and len(s) > len(m.group(0)) + 2:
+                expanded.append(m.group(1))          # just the greeting
+                expanded.append(s[m.end():].strip()) # the rest
+            else:
+                expanded.append(s)
+        sentences = expanded
 
         reply_texts:  list[str]  = []
         intent_dicts: list[dict] = []
@@ -983,14 +1075,57 @@ class AATASBrain:
                 if s_collapsed in greetings or any(k in s_low for k in ["good morning", "good afternoon", "good evening"]):
                     predictions.append(("chat_greeting", 0.9))
             
+            # ── Time query shortcut ─────────────────────────────────────────
+            _TIME_PATTERNS = re.compile(
+                r"\b(what(?:'s|\s+is)?\s+the\s+time|what\s+time\s+is\s+it|current\s+time|"
+                r"time\s+now|time\s+in\s+\w+|what\s+time\s+is\s+it\s+in)\b",
+                re.IGNORECASE,
+            )
+            if _TIME_PATTERNS.search(s_text):
+                import re as _re
+                _loc_match = _re.search(r"time\s+(?:is\s+it\s+)?in\s+([\w\s]+?)(?:\?|$)", s_text, _re.IGNORECASE)
+                if _loc_match:
+                    location = _loc_match.group(1).strip()
+                    # For specific locations, let the web search catchall handle it
+                    predictions.append(("web_search", 0.8))
+                else:
+                    # Local time — answer directly with datetime
+                    from datetime import datetime
+                    import zoneinfo
+                    try:
+                        sgt = zoneinfo.ZoneInfo("Asia/Singapore")
+                        now = datetime.now(sgt)
+                        time_reply = f"🕐 The current time is *{now.strftime('%I:%M %p')}* (SGT, UTC+8)."
+                    except Exception:
+                        now = datetime.now()
+                        time_reply = f"🕐 The current local time is *{now.strftime('%I:%M %p')}*."
+                    reply_texts.append(time_reply)
+                    intent_dicts.append({"intent": "chat_general", "confidence": 1.0, "source": "time_shortcut", "action_params": {}})
+                    save_conv_turn(db, user.id, "user",      user_message)
+                    save_conv_turn(db, user.id, "assistant", time_reply)
+                    return reply_texts, intent_dicts
+
             # Heuristic for 'recall' intent
             if not any(p[0] == "recall" for p in predictions):
-                recall_keywords = ["what was", "who is", "remember", "when is", "recall", "what did i say"]
-                if any(k in s_text.lower() for k in recall_keywords):
+                recall_keywords = ["what was", "who is", "remember", "when is", "recall", "what did i say", "who am i", "what do you know about me", "what do you remember", "what is my", "whats my", "what's my", "do you know my", "tell me my"]
+                # Exclude time queries from recall
+                if any(k in s_text.lower() for k in recall_keywords) and not _TIME_PATTERNS.search(s_text):
                     predictions.append(("recall", 0.6))
 
-            # Heuristic for 'search' intent follow-up
-            if not any(p[0] == "search" for p in predictions):
+            # Heuristic for 'search' email intent
+            _SEARCH_EMAIL_PATTERNS = re.compile(
+                r"^(?:search(?:\s+(?:for|emails?|my\s+emails?|inbox))?|"
+                r"find(?:\s+(?:emails?|messages?|mail))?(?:\s+(?:about|from|with|containing|where))?|"
+                r"look\s+up\s+(?:emails?|messages?)|"
+                r"any\s+(?:emails?|messages?)\s+(?:about|from|with|containing))\b",
+                re.IGNORECASE,
+            )
+            if _SEARCH_EMAIL_PATTERNS.match(s_text.strip()):
+                # Force search — remove any fetch_inbox the ML may have added
+                predictions = [p for p in predictions if p[0] != "fetch_inbox"]
+                if not any(p[0] == "search" for p in predictions):
+                    predictions.append(("search", 0.95))
+            elif not any(p[0] == "search" for p in predictions):
                 if s_text.lower().strip("?") in ["search", "find", "results", "any results"]:
                     predictions.append(("search", 0.7))
 
@@ -1039,12 +1174,12 @@ class AATASBrain:
                         "today's news", "latest news", "news about",
                         "what happened", "current events",
                     ]
-                    internal_keywords = ["inbox", "rule", "email", "archive", "trash", "label", "reply", "compose", "your name", "who are you"]
+                    internal_keywords = ["inbox", "rule", "email", "archive", "trash", "label", "reply", "compose", "your name", "who are you", "who am i"]
                     if any(k in s_text.lower() for k in web_keywords) and not any(k in s_text.lower() for k in internal_keywords):
                         predictions.append(("web_search", 0.6))
                     elif s_text.endswith("?") and not any(p[0] == "recall" for p in predictions):
                         # Don't trigger on very short questions or bot-identity questions
-                        if len(s_text.split()) > 3 and not any(k in s_text.lower() for k in ["your name", "who are you", "what are you"]):
+                        if len(s_text.split()) > 3 and not any(k in s_text.lower() for k in ["your name", "who are you", "what are you", "who am i"]):
                             predictions.append(("web_search", 0.55))
 
             # Heuristic for 'research' intent
@@ -1106,6 +1241,11 @@ class AATASBrain:
             label_name = self._parse_label(s_text)
             tone_name  = _parse_tone(s_text)
 
+            # If web_search is present, suppress knowledge intents that would
+            # double-respond with "I don't have that in my knowledge base"
+            if any(p[0] == "web_search" for p in predictions):
+                predictions = [p for p in predictions if p[0] not in ("science_query", "math_query", "recall")]
+
             # Filter out 'none' if we have other specific intents
             if len(predictions) > 1:
                 has_specific = any(p[0] != "none" and p[1] >= 0.4 for p in predictions)
@@ -1114,6 +1254,10 @@ class AATASBrain:
 
             for intent, confidence in predictions:
                 if confidence < CONFIDENCE_THRESHOLD:
+                    continue
+
+                # Let 'none' fall through to the web search catchall
+                if intent == "none":
                     continue
 
                 # Deduplicate intents (don't execute the same intent twice in one turn if it's the same index)
@@ -1157,6 +1301,26 @@ class AATASBrain:
                     mems = get_memories(db, user.id)
                     fact_found = False
                     fact_replies = []
+
+                    # Special case: "who am i" — dump everything known about the user
+                    if any(k in s_text.lower() for k in ["who am i", "what do you know about me", "what do you remember about me"]):
+                        known = []
+                        for k, v in mems.items():
+                            if k.startswith("fact:"):
+                                label = k.replace("fact:", "").replace("_", " ")
+                                known.append(f"• Your *{_esc(label)}* is *{_esc(v)}*")
+                            elif k.startswith("contact:"):
+                                email_addr = k.replace("contact:", "")
+                                known.append(f"• I know *{_esc(v)}* at `{_esc(email_addr)}`")
+                            elif k == "preferred_style":
+                                known.append(f"• Your preferred style is *{_esc(v)}*")
+                        if known:
+                            reply = "Here's what I know about you so far:\n" + "\n".join(known)
+                        else:
+                            reply = "I don't know much about you yet! The more we talk, the more I'll learn. 🧠"
+                        reply_texts.append(reply)
+                        intent_dicts.append(intent_dict)
+                        continue
                     
                     # 1. Check direct fact memory
                     for k, v in mems.items():
@@ -1246,35 +1410,95 @@ class AATASBrain:
                 reply_texts.append(reply)
                 intent_dicts.append(intent_dict)
 
-        # ── Final Fallback ──────────────────────────────────────────────────
+        # ── Cross-sentence deduplication ────────────────────────────────────
+        # If web_search was triggered anywhere, drop science/math/recall intents
+        # that would produce a redundant "not in knowledge base" reply.
+        if any(d["intent"] == "web_search" for d in intent_dicts):
+            keep_indices = [
+                i for i, d in enumerate(intent_dicts)
+                if d["intent"] not in ("science_query", "math_query", "recall")
+            ]
+            intent_dicts = [intent_dicts[i] for i in keep_indices]
+            reply_texts  = [reply_texts[i]  for i in keep_indices]
 
+        # ── Normal return (sklearn layer succeeded) ─────────────────────────
+        if reply_texts:
+            save_conv_turn(db, user.id, "user",      user_message)
+            save_conv_turn(db, user.id, "assistant", reply_texts[-1])
+            return reply_texts, intent_dicts
+
+        # ── Final Fallback ──────────────────────────────────────────────────
         # If absolutely NO high-confidence intent was found across ALL sentences
         if not reply_texts:
-            # Fallback to the best overall prediction if it's somewhat okay
-            overall_preds = self.intent_model.predict_multi(text, threshold=0.1)
-            if overall_preds and overall_preds[0][1] > 0.4:
-                # Still a bit low, but maybe we can just use the best one
-                # Actually, let's just use the low confidence reply logic
-                reply = self._low_confidence_reply(dominant_style)
+ 
+            # <<< NEURAL LAYER: try the PyTorch net before giving up >>>
+            neural_result = self.neural_fallback.predict(text)
+            if neural_result is not None:
+                n_intent, n_conf = neural_result
+                # Re-enter the normal intent handling pipeline for this intent
+                intent_dict = {
+                    "intent":        n_intent,
+                    "confidence":    n_conf,
+                    "source":        "neural_fallback",
+                    "action_params": {},
+                }
+                reply = pick_response(n_intent, dominant_style)
+                reply_texts  = [reply]
+                intent_dicts = [intent_dict]
+                log.info(
+                    f"NeuralFallback rescued intent '{n_intent}' "
+                    f"@ {n_conf:.2f} for text: '{text[:80]}'"
+                )
+                save_conv_turn(db, user.id, "user",      user_message)
+                save_conv_turn(db, user.id, "assistant", reply)
+                return [reply], [intent_dict]
             else:
-                reply = pick_response("none", dominant_style)
-            
-            save_conv_turn(db, user.id, "user",      user_message)
-            save_conv_turn(db, user.id, "assistant", reply)
-            return [reply], []
+                # <<< END NEURAL LAYER — web search catchall >>>
+                # Neither sklearn nor neural fallback was confident enough.
+                # Try a web search before giving up entirely.
+                try:
+                    from api.web_ops import search_web
+                    results = search_web(text, max_results=5, db=db)
+                    if results:
+                        # Build a conversational answer from the top snippets
+                        snippets = [
+                            r.get("snippet", "").strip()
+                            for r in results
+                            if r.get("snippet", "").strip()
+                        ]
+                        best = snippets[:3]
 
-        # Add memory confirmations to the first reply
-        if memory_notes and reply_texts:
-            note_str = "\n✨ " + "\n✨ ".join(memory_notes)
-            reply_texts[0] += note_str
+                        # Merge snippets into a flowing answer
+                        combined = " ".join(best)
+                        # Trim to ~400 chars at a sentence boundary
+                        if len(combined) > 400:
+                            cutoff = combined.rfind(".", 0, 400)
+                            combined = combined[:cutoff + 1] if cutoff > 100 else combined[:400] + "…"
 
-        if show_disclaimer:
-            reply_texts[-1] += DISCLAIMER
+                        top_link  = results[0].get("link", "").strip()
+                        top_title = results[0].get("title", "").strip()
 
-        save_conv_turn(db, user.id, "user",      user_message)
-        save_conv_turn(db, user.id, "assistant", "\n\n".join(reply_texts))
+                        reply = f"{combined}"
+                        if top_link:
+                            reply += f"\n\n📎 [{top_title}]({top_link})"
+                    else:
+                        reply = self._low_confidence_reply(dominant_style)
+                except Exception as exc:
+                    log.warning(f"Web search catchall failed: {exc}")
+                    reply = self._low_confidence_reply(dominant_style)
 
-        return reply_texts, intent_dicts
+                save_conv_turn(db, user.id, "user",      user_message)
+                save_conv_turn(db, user.id, "assistant", reply)
+                intent_dict = {
+                    "intent":        "web_search",
+                    "confidence":    0.0,
+                    "source":        "catchall",
+                    "action_params": {},
+                }
+                return [reply], [intent_dict]
+ 
+ 
+
 
     # ── Low-confidence reply ───────────────────────────────────────────────
 
@@ -1485,6 +1709,7 @@ class AATASBrain:
         self.priority_model.learn(subject, body, priority)
 
     def retrain(self) -> dict:
+        self.neural_fallback.train(self.intent_model.training_data)
         return {
             "intent":   self.intent_model.retrain(),
             "priority": self.priority_model.retrain(),

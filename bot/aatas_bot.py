@@ -5,7 +5,7 @@ Telegram Bot — Main Entry Point
 Features:
   - Multi-user with self-service Gmail OAuth onboarding
   - Self-trained ML brain (TF-IDF + MLP) — NO external AI API
-  - Secret trainer mode: /train 24426 — teach the bot directly from Telegram
+  - Secret trainer mode: /train [code] — teach the bot directly from Telegram
   - Persistent automation rules ("archive anything about Google Classroom")
   - Full email management: archive, label, reply, prioritise, summarise
   - Auto-fallback: low confidence → bot asks if you want to train it
@@ -580,7 +580,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Priority Model*\n"
         f"• Training examples: `{stats['priority_examples']}`\n"
         f"• Trained: {'✅ Yes' if stats['priority_trained'] else '⚠️ Using keyword heuristics'}\n\n"
-        "🎓 Train me more at any time with `/train 24426`!",
+        "🎓 Train me more at any time with `/train [code]`!",
         parse_mode="Markdown",
     )
 
@@ -886,14 +886,16 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
         brain.record_passive_example(original_text, action)
         if svc:
             query = original_text
-            # Remove "search for" or "find" from query
-            query = re.sub(r"^(?:search(?:\s+for)?|find(?:\s+emails?\s+about)?)\s+", "", query, flags=re.IGNORECASE).strip()
-            
-            emails = search_emails(svc, query,30)
-            
+            # Remove leading search verbs
+            query = re.sub(r"^(?:search(?:\s+(?:for|through|my\s+emails?\s+for))?|find(?:\s+(?:emails?\s+(?:about|with|from|containing))?)?)\s+", "", query, flags=re.IGNORECASE).strip()
+            # Remove trailing noise: "in my emails", "in my inbox", etc.
+            query = re.sub(r"\s+(?:in\s+(?:my\s+)?(?:emails?|inbox|mail)|from\s+my\s+(?:emails?|inbox))$", "", query, flags=re.IGNORECASE).strip()
+
             if not query or query == "?":
-                await update.message.reply_text("What would you like me to search for, Sir? (e.g. _'search for invoice'_)")
+                await update.message.reply_text("What would you like me to search for? (e.g. _'search for invoice'_)", parse_mode="Markdown")
                 return
+
+            emails = search_emails(svc, query, 30)
 
             if not emails:
                 await update.message.reply_text("No results found.")
@@ -904,12 +906,14 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
                     if ranked: emails = ranked
                 
                 _cache[tg_id] = emails
-                lines = [f"🔍 *Results for '{query}':*\n"]
+                lines = [f"🔍 *Results for '{_esc(query)}':*\n"]
                 for e in emails:
+                    subj = _esc(e.get('subject', e.get('title', ''))[:55])
                     if e.get('sender'):
-                        lines.append(f"`{e['idx']}.` *{e['subject'][:45]}*\n   👤 {e['sender'][:35]}")
+                        sender = _esc(e['sender'][:40])
+                        lines.append(f"`{e['idx']}.` *{subj}*\n   👤 {sender}")
                     else:
-                        lines.append(f"`{e['idx']}.` *{e.get('title', e.get('subject',''))[:60]}*")
+                        lines.append(f"`{e['idx']}.` *{subj}*")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "web_search":
@@ -947,12 +951,20 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
             return
 
         # Check if this query is already cached BEFORE calling search_web
-        # so we can show the right status message to the user
+        # so we can show the right status message to the user.
+        # Apply the same generic_map normalisation that search_web uses internally
+        # so the cache key matches.
+        _GENERIC_MAP = {
+            "news": "latest world news today", "todays news": "latest world news today",
+            "today's news": "latest world news today", "latest news": "latest world news today",
+            "headlines": "top news headlines today", "weather": "weather today",
+        }
+        _cache_query = _GENERIC_MAP.get(query.lower().strip(), query)
         _is_cache_hit = False
         if db is not None:
             try:
                 from db.database import get_cached_search as _gcs
-                _is_cache_hit = _gcs(db, query) is not None
+                _is_cache_hit = _gcs(db, _cache_query) is not None
             except Exception:
                 pass
 
@@ -1025,7 +1037,7 @@ async def _execute_intent(update, ctx, db, user, svc, intent: dict, ai_reply: st
             lines = [f"📊 *Inbox by priority (last {len(emails)}):*\n"]
             for e, p, c in scored:
                 icon = PRIORITY_ICON.get(p, "•")
-                lines.append(f"`{e['idx']}.` {icon} `{p}` — {e['subject'][:40]}")
+                lines.append(f"`{e['idx']}.` {icon} `{p}` — {_esc(e['subject'][:40])}")
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "analyse" and idx:
@@ -1416,14 +1428,24 @@ if __name__ == "__main__":
 
     async def post_init(app):
         await _set_commands(app)
+        # Ensure all DB tables exist (safe on existing DBs — only creates missing tables)
+        try:
+            from db.database import Base, engine
+            Base.metadata.create_all(engine)
+            log.info("Startup: DB tables verified/created")
+        except Exception as exc:
+            log.warning(f"Startup DB migration failed: {exc}")
         # Clean up any stale search cache rows from previous runs
         _startup_db = _db()
         try:
             deleted = purge_expired_cache(_startup_db)
             if deleted:
                 log.info(f"Startup: purged {deleted} expired search cache entries")
+            stats = get_cache_stats(_startup_db)
+            log.info(f"Startup: search cache has {stats['live_entries']} live entries")
         except Exception as exc:
-            log.warning(f"Startup cache purge failed (non-fatal): {exc}")
+            import traceback
+            log.warning(f"Startup cache init failed: {exc}\n{traceback.format_exc()}")
         finally:
             _startup_db.close()
 
